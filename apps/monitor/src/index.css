@@ -208,3 +208,8 @@ legend { color: var(--muted); font-size: 11px; text-transform: uppercase; letter
 .howto summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .howto ul { margin: 6px 0 0; padding-left: 18px; line-height: 1.5; color: var(--text); }
 .modal { width: min(760px, 96vw); }
+.report tr.sep td { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; padding-top: 10px; text-align: left; }
+.report tr.clickable { cursor: pointer; }
+.report tr.clickable:hover td { background: #2a2e39; }
+.compare td:first-child { white-space: nowrap; }
+.modal { width: min(880px, 96vw); }

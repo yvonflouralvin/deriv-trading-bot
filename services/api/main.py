@@ -583,13 +583,14 @@ async def trends_current():
 class TrendReportIn(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=20)
     days: int = Field(90, ge=7, le=365)
+    variants: list[str] = []          # vide = toutes les variantes
 
 
 @app.post("/api/trend-reports", dependencies=[Depends(auth)], status_code=201)
 async def create_trend_report(body: TrendReportIn):
     async with pool.acquire() as con:
-        rid = await con.fetchval("INSERT INTO trend_reports(symbols, tfs, days) VALUES($1, $2, $3) RETURNING id",
-                                 body.symbols, TREND_TFS, body.days)
+        rid = await con.fetchval("INSERT INTO trend_reports(symbols, tfs, days, variants) VALUES($1, $2, $3, $4) "
+                                 "RETURNING id", body.symbols, TREND_TFS, body.days, body.variants)
     return {"id": rid}
 
 

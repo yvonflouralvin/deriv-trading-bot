@@ -30,18 +30,21 @@ la dernière bougie déjà clôturée.
 from bisect import bisect_right
 from dataclasses import dataclass
 
-VERSION = 1
+VERSION = 2
 
 
 @dataclass(frozen=True)
 class TrendParams:
     atr_period: int = 14
+    pivots: str = "zigzag"        # "zigzag" (retournement de N ATR) ou "fractal" (N bougies de chaque côté)
     zigzag_atr: float = 2.0       # retournement du ZigZag : 2 ATR
+    fractal_n: int = 2
     ema_fast: int = 50
     ema_slow: int = 200
     slope_bars: int = 10
     adx_period: int = 14
     adx_min: float = 20.0
+    adx_rising_bars: int = 0      # > 0 : le directionnel ne compte que si l'ADX monte sur N bougies
     threshold: float = 0.5
 
     @property
@@ -60,6 +63,8 @@ class TrendState:
     ema: int
     di: int
     atr: float
+    age: int = 0          # nombre de bougies depuis le début de l'état actuel
+    ext: float = 0.0      # écart clôture - EMA rapide, en ATR (signé)
 
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +169,32 @@ def structure_series(bars, atr_vals, mult):
     return out
 
 
+def fractal_structure(bars, n):
+    """Variante rapide : pivots fractals (un sommet est confirmé quand les n
+    bougies suivantes sont plus basses), même logique sommets/creux + cassure."""
+    out = [0] * len(bars)
+    highs: list[float] = []
+    lows: list[float] = []
+    for i, b in enumerate(bars):
+        j = i - n                                   # candidat pivot, confirmé à la bougie i
+        if j >= n:
+            win = bars[j - n:i + 1]
+            if bars[j].high == max(x.high for x in win) and bars[j].high > max(x.high for x in bars[j + 1:i + 1]):
+                highs.append(bars[j].high)
+            if bars[j].low == min(x.low for x in win) and bars[j].low < min(x.low for x in bars[j + 1:i + 1]):
+                lows.append(bars[j].low)
+        s = 0
+        if len(highs) >= 2 and len(lows) >= 2:
+            hh, hl = highs[-1] > highs[-2], lows[-1] > lows[-2]
+            s = 1 if hh and hl else -1 if not hh and not hl else 0
+        if highs and b.close > highs[-1]:
+            s = 1
+        elif lows and b.close < lows[-1]:
+            s = -1
+        out[i] = s
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # États
 # --------------------------------------------------------------------------- #
@@ -175,19 +206,25 @@ def compute(bars, p: TrendParams = TrendParams()) -> list[TrendState]:
     atr_v = atr(bars, p.atr_period)
     ef, es = _ema(closes, p.ema_fast), _ema(closes, p.ema_slow)
     adx, pdi, mdi = adx_di(bars, p.adx_period)
-    struct = structure_series(bars, atr_v, p.zigzag_atr)
+    struct = (fractal_structure(bars, p.fractal_n) if p.pivots == "fractal"
+              else structure_series(bars, atr_v, p.zigzag_atr))
     out = []
+    prev_state, age = None, 0
+    k = p.adx_rising_bars
     for i in range(p.warmup, len(bars)):
         if None in (es[i], ef[i], ef[i - p.slope_bars], adx[i], pdi[i], mdi[i], atr_v[i]):
             continue
         slope = ef[i] - ef[i - p.slope_bars]
         e = 1 if closes[i] > es[i] and slope > 0 else -1 if closes[i] < es[i] and slope < 0 else 0
-        d = 0 if adx[i] < p.adx_min else (1 if pdi[i] > mdi[i] else -1 if mdi[i] > pdi[i] else 0)
+        rising = not k or (adx[i - k] is not None and adx[i] > adx[i - k])
+        d = 0 if adx[i] < p.adx_min or not rising else (1 if pdi[i] > mdi[i] else -1 if mdi[i] > pdi[i] else 0)
         score = 0.5 * struct[i] + 0.3 * e + 0.2 * d
         state = 1 if score >= p.threshold else -1 if score <= -p.threshold else 0
+        age = age + 1 if state == prev_state else 1
+        prev_state = state
         strength = round(abs(score) * min(1.0, adx[i] / 40) * 100)
         out.append(TrendState(bars[i].time, state, round(score, 3), strength, round(adx[i], 2),
-                              struct[i], e, d, atr_v[i]))
+                              struct[i], e, d, atr_v[i], age, round((closes[i] - ef[i]) / atr_v[i], 3)))
     return out
 
 
@@ -204,12 +241,21 @@ class StateLookup:
         return self.states[i] if i >= 0 else None
 
 
-def align(lookups: list[StateLookup], t: int) -> int | None:
-    """+1 si toutes les unités de temps sont haussières, -1 si toutes baissières,
-    0 sinon ; None si une unité de temps n'a pas encore d'état."""
+def align(lookups: list[StateLookup], t: int, mode: str = "all") -> int | None:
+    """Confirmation multi-timeframe (lookups de la plus grande à la plus petite UT).
+    mode "all"  : +1 / -1 si TOUTES les unités de temps sont d'accord, 0 sinon ;
+    mode "bias" : la plus grande UT sert de biais (elle ne doit pas être CONTRE,
+                  neutre accepté) et les autres doivent être d'accord.
+    None si une unité de temps n'a pas encore d'état."""
     states = [lk.at(t) for lk in lookups]
     if any(s is None for s in states):
         return None
+    if mode == "bias":
+        rest = {s.state for s in states[1:]}
+        if len(rest) == 1 and 0 not in rest:
+            d = rest.pop()
+            return d if states[0].state != -d else 0
+        return 0
     vals = {s.state for s in states}
     if vals == {1}:
         return 1

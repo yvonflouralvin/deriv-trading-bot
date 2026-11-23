@@ -242,3 +242,6 @@ DROP TRIGGER IF EXISTS trend_reports_created ON trend_reports;
 CREATE TRIGGER trend_reports_created
     AFTER INSERT ON trend_reports
     FOR EACH ROW EXECUTE FUNCTION notify_trend_reports();
+
+-- v2 : comparateur de variantes du détecteur
+ALTER TABLE trend_reports ADD COLUMN IF NOT EXISTS variants text[] NOT NULL DEFAULT '{}';

@@ -181,6 +181,7 @@ export interface GroupStats {
   mfe_mae?: number | null
   episodes?: number
   episode_hit?: number | null
+  ci?: number | null
   in_sample?: GroupStats
   out_of_sample?: GroupStats
 }
@@ -195,12 +196,34 @@ export interface Stability {
   mean_strength: number
 }
 
+export interface LagStats {
+  legs: number
+  detected?: number
+  missed_pct?: number | null
+  lag_hours_median?: number | null
+  done_pct_median?: number | null
+}
+
 export interface SymbolReport {
   symbol: string
   samples: number
-  first_candle: number
+  period_start: number
   horizons: Record<string, Record<string, GroupStats>>
   stability: Record<string, Stability>
+  lag: LagStats
+}
+
+export interface VariantReport {
+  id: string
+  name: string
+  description: string
+  tfs: number[]
+  align_mode: 'all' | 'bias'
+  symbols: SymbolReport[]
+  skipped: string[]
+  pooled: Record<string, Record<string, GroupStats>>
+  lag: LagStats
+  period_start: number | null
 }
 
 export interface TrendReport {
@@ -212,8 +235,7 @@ export interface TrendReport {
   error: string | null
   created_at: number
   result: {
-    symbols: SymbolReport[]
-    pooled: Record<string, Record<string, GroupStats>>
+    variants?: VariantReport[]
     missing: string[]
     horizons: number[]
   } | null
