@@ -16,6 +16,7 @@ import asyncpg
 from strategies import Bar
 
 from . import report, trend
+from .variants import BY_ID, VARIANTS
 
 log = logging.getLogger("analysis")
 
@@ -101,39 +102,58 @@ class AnalysisService:
         t0 = time.monotonic()
         end = int(time.time())
         start = end - rep["days"] * 86400
-        params = trend.TrendParams()
-        results, missing = [], []
+        variants = [BY_ID[v] for v in (rep["variants"] or []) if v in BY_ID] or VARIANTS
+        tfs = sorted({tf for v in variants for tf in v.tfs} | {report.NORM_TF}, reverse=True)
+        warm_bars = max(v.params.warmup for v in variants) + 50
+
+        # bougies chargées une seule fois par paire et par unité de temps
+        data, missing = {}, []
         for sym in rep["symbols"]:
-            data = {}
+            d = {}
             async with self.pool.acquire() as con:
-                for tf in rep["tfs"]:
-                    warm = (params.warmup + 50) * tf
+                for tf in tfs:
                     rows = await con.fetch("""
                         SELECT extract(epoch FROM ts)::bigint AS t, open, high, low, close FROM candles
                         WHERE symbol=$1 AND tf=$2 AND ts >= to_timestamp($3)
                           AND ts + make_interval(secs => $2) <= to_timestamp($4) ORDER BY ts""",
-                        sym, tf, start - warm, end)
-                    data[tf] = _bars(rows)
-            if any(len(v) <= params.warmup for v in data.values()):
-                missing.append(sym)
-                continue
-            first = min(v[0].time for v in data.values())
-            res = await asyncio.to_thread(report.evaluate_symbol, sym, data, list(rep["tfs"]), max(start, first), end, params)
-            res["first_candle"] = first
-            results.append(res)
+                        sym, tf, start - warm_bars * tf, end)
+                    d[tf] = _bars(rows)
+            data[sym] = d
+
+        out_variants = []
+        for v in variants:
+            results, skipped = [], []
+            for sym in rep["symbols"]:
+                d = data[sym]
+                need = list(v.tfs) + [report.NORM_TF]
+                if any(len(d.get(tf, [])) <= v.params.warmup for tf in need):
+                    skipped.append(sym)
+                    continue
+                first = max(d[tf][0].time for tf in need)     # période commune à toutes les UT
+                vstart = max(start, first + v.params.warmup * max(v.tfs))
+                res = await asyncio.to_thread(report.evaluate_symbol, sym, d, v, vstart, end)
+                res["period_start"] = vstart
+                results.append(res)
+            out_variants.append({
+                "id": v.id, "name": v.name, "description": v.description, "tfs": list(v.tfs),
+                "align_mode": v.align_mode, "symbols": results, "skipped": skipped,
+                "pooled": report.pooled(results) if results else {},
+                "lag": report.pooled_lag(results),
+                "period_start": min((r["period_start"] for r in results), default=None),
+            })
+            missing.extend(s for s in skipped if s not in missing)
         result = {
-            "symbols": results,
-            "pooled": report.pooled(results, rep["tfs"]) if results else {},
+            "variants": out_variants,
             "missing": missing,
             "horizons": list(report.HORIZONS_H),
-            "params": params.__dict__,
             "version": trend.VERSION,
             "seconds": round(time.monotonic() - t0, 2),
         }
         async with self.pool.acquire() as con:
             await con.execute("UPDATE trend_reports SET status='done', result=$2, finished_at=now() WHERE id=$1",
                               rid, json.dumps(result))
-        log.info("Rapport de tendance %s : %d paire(s), %s s", rid, len(results), result["seconds"])
+        log.info("Rapport de tendance %s : %d variante(s) × %d paire(s), %s s", rid, len(out_variants),
+                 len(rep["symbols"]), result["seconds"])
 
 
 def _ts(epoch):

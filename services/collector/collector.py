@@ -35,7 +35,7 @@ DEFAULT_SYMBOLS = [s for s in os.getenv("DEFAULT_SYMBOLS", "R_100,R_75,1HZ100V")
 CATALOG_REFRESH_S = int(os.getenv("CATALOG_REFRESH_HOURS", "6")) * 3600
 RETRY_FAILED_S = 300
 # Historique profond inutile (et coûteux) sur les petites unités de temps :
-# au-delà de SHORT_TF_MAX_DAYS jours, seules les UT >= 15 min sont chargées.
+# au-delà de SHORT_TF_MAX_DAYS jours, seules les UT >= 5 min sont chargées (M1 plafonnée).
 SHORT_TF_MAX_DAYS = int(os.getenv("SHORT_TF_MAX_DAYS", "30"))
 HISTORY_PAGE = int(os.getenv("HISTORY_PAGE", "1000"))
 SCHEMA_FILE = Path(os.getenv("SCHEMA_FILE", Path(__file__).with_name("schema.sql")))
@@ -189,7 +189,7 @@ class Collector:
                 last = await con.fetchval(
                     "SELECT extract(epoch FROM max(ts))::bigint FROM candles WHERE symbol=$1 AND tf=$2",
                     symbol, tf)
-            tf_days = days if tf >= 900 else min(days, SHORT_TF_MAX_DAYS)
+            tf_days = days if tf >= 300 else min(days, SHORT_TF_MAX_DAYS)
             wanted = now - max(tf_days * 86400, 300 * tf)
             got = 0
             if last:

@@ -98,14 +98,23 @@ function Cell({ state, strength }: { state: number; strength: number }) {
 }
 
 // --------------------------------------------------------------------------- //
+const sig = (g?: GroupStats) => {
+  // couleur seulement si l'avantage dépasse la marge d'erreur
+  if (!g || g.edge_hit == null || g.ci == null) return ''
+  return g.edge_hit > g.ci ? 'up' : g.edge_hit < -g.ci ? 'down' : 'muted'
+}
+const edge = (g?: GroupStats) => (g?.edge_hit == null ? '—'
+  : `${g.edge_hit > 0 ? '+' : ''}${(g.edge_hit * 100).toFixed(1)}${g.ci != null ? ` ±${(g.ci * 100).toFixed(1)}` : ''}`)
+
 function ReportModal({ symbols, tfs, onClose, onError }: {
   symbols: string[]; tfs: Timeframe[]; onClose: () => void; onError: (e: unknown) => void
 }) {
-  const [chosen, setChosen] = useState<string[]>(symbols.filter((s) => s.startsWith('frx')).length
-    ? symbols.filter((s) => s.startsWith('frx')) : symbols.slice(0, 3))
-  const [days, setDays] = useState(90)
+  const fx = symbols.filter((s) => s.startsWith('frx'))
+  const [chosen, setChosen] = useState<string[]>(fx.length ? fx : symbols.slice(0, 3))
+  const [days, setDays] = useState(365)
   const [rep, setRep] = useState<TrendReport | null>(null)
   const [history, setHistory] = useState<TrendReport[]>([])
+  const [variant, setVariant] = useState('A')
   const [view, setView] = useState('pooled')
   const [h, setH] = useState('24')
 
@@ -115,7 +124,7 @@ function ReportModal({ symbols, tfs, onClose, onError }: {
     const id = window.setTimeout(() => api.trendReport(rep.id).then((r) => {
       setRep(r)
       if (r.status === 'done') api.trendReports().then(setHistory).catch(() => {})
-    }).catch(onError), 1000)
+    }).catch(onError), 1500)
     return () => window.clearTimeout(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rep])
@@ -129,18 +138,19 @@ function ReportModal({ symbols, tfs, onClose, onError }: {
   }
   const busy = rep && (rep.status === 'pending' || rep.status === 'running')
   const res = rep?.status === 'done' ? rep.result : null
-  const table: Record<string, GroupStats> | undefined = res
-    ? (view === 'pooled' ? res.pooled : res.symbols.find((s) => s.symbol === view)?.horizons)?.[h]
-    : undefined
-  const label = (tf: number) => tfs.find((t) => t.tf === tf)?.label ?? `${tf}s`
+  const vars = res?.variants ?? []
+  const cur = vars.find((v) => v.id === variant) ?? vars[0]
+  const table = cur ? (view === 'pooled' ? cur.pooled : cur.symbols.find((s) => s.symbol === view)?.horizons)?.[h] : undefined
+  const label = (tf: number) => tfs.find((t) => t.tf === tf)?.label ?? ({ 300: '5m', 900: '15m', 3600: '1h', 14400: '4h' } as Record<number, string>)[tf] ?? `${tf}s`
+  const lag = cur ? (view === 'pooled' ? cur.lag : cur.symbols.find((s) => s.symbol === view)?.lag) : undefined
 
   return (
     <Modal title="Évaluer le détecteur de tendance" onClose={onClose}>
       <div className="form">
         <p className="muted small hint">
-          Question testée : quand les unités de temps sont alignées, le prix part-il <b>ensuite</b> dans ce sens plus
-          souvent qu'à un instant quelconque (la <b>référence</b>) ? Mesures en ATR H1, sur les heures de marché
-          suivantes. Les 30 % les plus récents servent de validation.
+          Compare 5 variantes du détecteur sur les mêmes données. Pour chacune : la tendance confirmée annonce-t-elle
+          la suite mieux que le hasard, avec quel retard, selon sa phase, et un <b>repli dans le sens de la
+          tendance</b> repart-il dans ce sens ? Mesures en ATR H1 ; les 30 % les plus récents servent de validation.
         </p>
         <div className="sym-pick">
           {symbols.map((s) => (
@@ -158,33 +168,75 @@ function ReportModal({ symbols, tfs, onClose, onError }: {
             </select>
           </label>
           <button className="primary" disabled={!!busy || !chosen.length} onClick={run}>
-            {busy ? 'Calcul…' : "Lancer l'évaluation"}
+            {busy ? 'Calcul… (≈ 1 min)' : "Lancer l'évaluation"}
           </button>
         </div>
 
         {rep?.status === 'error' && <p className="error">Erreur : {rep.error}</p>}
-        {res && (
+        {res && !res.variants && <p className="muted small warn">Rapport de l'ancienne version : relancez une évaluation.</p>}
+        {res && vars.length > 0 && (
           <>
             {res.missing.length > 0 && (
-              <p className="muted small warn">Historique insuffisant pour : {res.missing.join(', ')} (le collecteur le
-                charge peut-être encore).</p>
+              <p className="muted small warn">Historique insuffisant pour : {res.missing.join(', ')} (certaines
+                variantes ; le collecteur le charge peut-être encore).</p>
             )}
-            {res.symbols.length > 0 && table && (
-              <>
+            <div className="row-inline">
+              <label>Horizon
+                <select value={h} onChange={(e) => setH(e.target.value)}>
+                  {res.horizons.map((x) => <option key={x} value={String(x)}>{x} h de marché</option>)}
+                </select>
+              </label>
+            </div>
+            <Verdict vars={vars} h={h} />
+            <fieldset>
+              <legend>Comparaison des variantes (toutes paires)</legend>
+              <table className="report compare">
+                <thead>
+                  <tr>
+                    <th>Variante</th><th title="Périodes d'alignement distinctes">Épisodes</th>
+                    <th title="Avantage ± marge d'erreur à 95 %">Avantage</th><th>Validation</th>
+                    <th title="Heures entre le départ d'un vrai mouvement et la confirmation">Retard</th>
+                    <th title="Part du mouvement déjà faite au moment de la confirmation">Déjà fait</th>
+                    <th title="Vrais mouvements jamais confirmés">Manqués</th>
+                    <th title="Repli du RSI de la petite UT dans le sens de la tendance des 2 grandes UT">Repli dans le sens</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {vars.map((v) => {
+                    const t = v.pooled[h] ?? {}
+                    const al = t.aligned
+                    return (
+                      <tr key={v.id} className={`${v.id === cur?.id ? 'strong' : ''} clickable`} onClick={() => setVariant(v.id)}
+                          title={v.description}>
+                        <td><b>{v.id}</b> {v.name}</td>
+                        <td>{al?.episodes ?? '—'}</td>
+                        <td className={sig(al)}>{edge(al)}</td>
+                        <td className={sig(al?.out_of_sample)}>{edge(al?.out_of_sample)}</td>
+                        <td>{v.lag.lag_hours_median != null ? `${v.lag.lag_hours_median} h` : '—'}</td>
+                        <td>{v.lag.done_pct_median != null ? `${Math.round(v.lag.done_pct_median * 100)} %` : '—'}</td>
+                        <td>{v.lag.missed_pct != null ? `${Math.round(v.lag.missed_pct * 100)} %` : '—'}</td>
+                        <td className={sig(t.pb_with)}>{edge(t.pb_with)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+              <p className="muted small">Avantages en points de % ± marge d'erreur à 95 %. Vert / rouge seulement quand
+                l'écart dépasse la marge ; gris = dans le bruit. Cliquez une variante pour le détail.</p>
+            </fieldset>
+
+            {cur && table && (
+              <fieldset>
+                <legend>Détail — {cur.id} {cur.name} ({cur.tfs.map(label).join(' / ')}{cur.align_mode === 'bias' ? ', grande UT = biais' : ''})</legend>
+                <p className="muted small hint">{cur.description}</p>
                 <div className="row-inline">
                   <label>Vue
                     <select value={view} onChange={(e) => setView(e.target.value)}>
                       <option value="pooled">Toutes les paires</option>
-                      {res.symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
-                    </select>
-                  </label>
-                  <label>Horizon
-                    <select value={h} onChange={(e) => setH(e.target.value)}>
-                      {res.horizons.map((x) => <option key={x} value={String(x)}>{x} h de marché</option>)}
+                      {cur.symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
                     </select>
                   </label>
                 </div>
-                <Verdict t={table} />
                 <table className="report">
                   <thead>
                     <tr><th>Situation</th><th>Part du temps</th><th>Épisodes</th><th>Bon sens</th>
@@ -196,73 +248,67 @@ function ReportModal({ symbols, tfs, onClose, onError }: {
                       <td title="% des cas où le prix monte">{pct(table.baseline?.pct_up)} ↑</td><td>—</td>
                       <td>{num(table.baseline?.mean_fwd)}</td><td>—</td>
                     </tr>
-                    <Row name="Aligné haussier (3/3)" g={table.aligned_up} strong />
-                    <Row name="Aligné baissier (3/3)" g={table.aligned_down} strong />
-                    {tfs.map((t) => [
-                      <Row key={`${t.tf}u`} name={`${t.label} seul haussier`} g={table[`${t.tf}_up`]} />,
-                      <Row key={`${t.tf}d`} name={`${t.label} seul baissier`} g={table[`${t.tf}_down`]} />,
+                    <Row name="Aligné haussier" g={table.aligned_up} strong />
+                    <Row name="Aligné baissier" g={table.aligned_down} strong />
+                    <tr className="sep"><td colSpan={7}>Selon la phase de la tendance au moment de la mesure</td></tr>
+                    <Row name="Naissante (jeune, proche de sa moyenne)" g={table.phase_young} />
+                    <Row name="Mature" g={table.phase_mature} />
+                    <Row name="Étendue (≥ 2,5 ATR de sa moyenne)" g={table.phase_extended} />
+                    <tr className="sep"><td colSpan={7}>Repli du RSI de la petite UT (sous 40 / au-dessus de 60)</td></tr>
+                    <Row name="Dans le sens de la tendance" g={table.pb_with} strong />
+                    <Row name="Hors tendance (2 grandes UT pas d'accord)" g={table.pb_neutral} />
+                    <Row name="À contre-tendance" g={table.pb_counter} />
+                    <tr className="sep"><td colSpan={7}>Une seule unité de temps</td></tr>
+                    {cur.tfs.map((tf) => [
+                      <Row key={`${tf}u`} name={`${label(tf)} seul haussier`} g={table[`${tf}_up`]} />,
+                      <Row key={`${tf}d`} name={`${label(tf)} seul baissier`} g={table[`${tf}_down`]} />,
                     ])}
                   </tbody>
                 </table>
-                <fieldset>
-                  <legend>Tient-il dans le temps ? (réglage 70 % / validation 30 %)</legend>
-                  <table className="report">
-                    <thead><tr><th></th><th>Avantage période 1</th><th>Avantage validation</th><th>Mvt validation (ATR)</th></tr></thead>
-                    <tbody>
-                      {(['aligned_up', 'aligned_down'] as const).map((k) => (
-                        <tr key={k}>
-                          <td>{k === 'aligned_up' ? 'Aligné haussier' : 'Aligné baissier'}</td>
-                          <td className={cls(table[k]?.in_sample?.edge_hit)}>{pct(table[k]?.in_sample?.edge_hit, true)}</td>
-                          <td className={cls(table[k]?.out_of_sample?.edge_hit)}>{pct(table[k]?.out_of_sample?.edge_hit, true)}</td>
-                          <td>{num(table[k]?.out_of_sample?.mean_dir)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </fieldset>
+                {lag && lag.legs > 0 && (
+                  <p className="muted small">
+                    Retard : sur {lag.legs} vrais mouvements (≥ 4 ATR H1, repérés après coup), {lag.detected} confirmés,
+                    en médiane <b>{lag.lag_hours_median} h</b> après leur départ, quand <b>{Math.round((lag.done_pct_median ?? 0) * 100)} %</b>
+                    {' '}du mouvement était déjà fait ; {Math.round((lag.missed_pct ?? 0) * 100)} % jamais confirmés.
+                  </p>
+                )}
                 {view !== 'pooled' && (() => {
-                  const sr = res.symbols.find((s) => s.symbol === view)
+                  const sr = cur.symbols.find((s) => s.symbol === view)
                   if (!sr) return null
                   return (
-                    <fieldset>
-                      <legend>Stabilité du détecteur</legend>
-                      <table className="report">
-                        <thead><tr><th></th><th>Haussier</th><th>Baissier</th><th>Neutre</th><th>Changements / jour</th><th>Durée médiane</th><th>Force moy.</th></tr></thead>
-                        <tbody>
-                          {tfs.map((t) => {
-                            const st = sr.stability[String(t.tf)]
-                            if (!st) return null
-                            return (
-                              <tr key={t.tf}>
-                                <td>{label(t.tf)}</td><td>{pct(st.share_up)}</td><td>{pct(st.share_down)}</td>
-                                <td>{pct(st.share_neutral)}</td><td>{num(st.flips_per_day, 1)}</td>
-                                <td>{num(st.median_run_hours, 1)} h</td><td>{num(st.mean_strength, 0)}</td>
-                              </tr>
-                            )
-                          })}
-                        </tbody>
-                      </table>
-                    </fieldset>
+                    <table className="report">
+                      <thead><tr><th>Stabilité</th><th>Haussier</th><th>Baissier</th><th>Neutre</th><th>Changements / jour</th><th>Durée médiane</th></tr></thead>
+                      <tbody>
+                        {cur.tfs.map((tf) => {
+                          const st = sr.stability[String(tf)]
+                          if (!st) return null
+                          return (
+                            <tr key={tf}><td>{label(tf)}</td><td>{pct(st.share_up)}</td><td>{pct(st.share_down)}</td>
+                              <td>{pct(st.share_neutral)}</td><td>{num(st.flips_per_day, 1)}</td><td>{num(st.median_run_hours, 1)} h</td></tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
                   )
                 })()}
-                <details className="howto">
-                  <summary>Comment lire ce rapport</summary>
-                  <ul className="small">
-                    <li><b>Bon sens</b> : % des cas où le prix est allé dans la direction annoncée à la fin de l'horizon.</li>
-                    <li><b>Avantage</b> : écart avec la référence. C'est LE chiffre : +5 pts = le détecteur voit juste 5 fois
-                      de plus sur 100 que le hasard. Proche de 0 = aucune valeur.</li>
-                    <li><b>Mvt moyen</b> : chemin parcouru dans le sens annoncé, en ATR H1 (1 = une bougie H1 « typique »).</li>
-                    <li><b>MFE / MAE</b> : excursion favorable maximale ÷ défavorable maximale. Au-dessus de 1, le prix va plus
-                      loin dans notre sens que contre nous — utile pour placer stop et objectif.</li>
-                    <li><b>Épisodes</b> : nombre de périodes d'alignement distinctes. C'est la vraie taille d'échantillon :
-                      en dessous d'une trentaine, les pourcentages sont fragiles.</li>
-                    <li><b>Lignes « seul »</b> : une seule unité de temps. Si l'alignement 3/3 ne fait pas mieux qu'elles, la
-                      confirmation fractale n'apporte rien.</li>
-                    <li><b>Validation</b> : l'avantage doit garder le même signe sur les 30 % de données les plus récentes.</li>
-                  </ul>
-                </details>
-              </>
+              </fieldset>
             )}
+            <details className="howto">
+              <summary>Comment lire ce rapport</summary>
+              <ul className="small">
+                <li><b>Avantage</b> : écart (en points de %) entre le taux de réussite et celui du hasard dans le même
+                  sens. « +6,0 ±4,2 » = l'avantage est probablement entre +1,8 et +10,2 : réel. « +2,0 ±4,2 » = dans le bruit.</li>
+                <li><b>Validation</b> : le même calcul sur les 30 % de données les plus récentes, jamais utilisées pour
+                  choisir. Un avantage qui disparaît en validation ne doit pas être cru.</li>
+                <li><b>Retard / Déjà fait</b> : sur les grands mouvements réels, combien d'heures après leur départ la
+                  tendance est confirmée et quelle part du mouvement est déjà consommée. Plus c'est bas, mieux c'est.</li>
+                <li><b>Phases</b> : si « Naissante » est positif et « Étendue » négatif, le problème vient d'entrées
+                  trop tardives ; il faudra n'entrer que tôt dans la tendance.</li>
+                <li><b>Repli dans le sens</b> : la question de votre méthode — un repli pendant une tendance confirmée
+                  par les 2 grandes UT repart-il dans le sens de la tendance ? À comparer avec « Hors tendance ».</li>
+                <li><b>Épisodes</b> : périodes distinctes ; c'est la vraie taille d'échantillon, d'où la marge d'erreur.</li>
+              </ul>
+            </details>
           </>
         )}
 
@@ -284,8 +330,6 @@ function ReportModal({ symbols, tfs, onClose, onError }: {
   )
 }
 
-const cls = (x: number | null | undefined) => (x == null ? '' : x > 0.02 ? 'up' : x < -0.02 ? 'down' : 'muted')
-
 function Row({ name, g, strong }: { name: string; g?: GroupStats; strong?: boolean }) {
   if (!g || !g.n) return <tr className="muted"><td>{name}</td><td colSpan={6}>aucun cas</td></tr>
   return (
@@ -294,28 +338,27 @@ function Row({ name, g, strong }: { name: string; g?: GroupStats; strong?: boole
       <td>{pct(g.share)}</td>
       <td>{g.episodes ?? '—'}</td>
       <td>{pct(g.hit)}</td>
-      <td className={cls(g.edge_hit)}><b>{pct(g.edge_hit, true)}</b></td>
+      <td className={sig(g)}><b>{edge(g)}</b></td>
       <td>{num(g.mean_dir)}</td>
       <td>{num(g.mfe_mae)}</td>
     </tr>
   )
 }
 
-function Verdict({ t }: { t: Record<string, GroupStats> }) {
-  const up = t.aligned_up, dn = t.aligned_down
-  if (!up?.n || !dn?.n) return <p className="muted small">Pas assez de périodes alignées pour conclure.</p>
-  const eps = (up.episodes ?? 0) + (dn.episodes ?? 0)
-  const both = (up.edge_hit ?? 0) > 0.03 && (dn.edge_hit ?? 0) > 0.03
-  const holds = (up.out_of_sample?.edge_hit ?? 0) > 0 && (dn.out_of_sample?.edge_hit ?? 0) > 0
-  const beatsSingle = Object.entries(t)
-    .filter(([k]) => k.endsWith('_up') && k !== 'aligned_up')
-    .every(([, g]) => (up.edge_hit ?? 0) >= (g.edge_hit ?? 0))
-  let msg: string, c: string
-  if (eps < 30) { msg = `Seulement ${eps} épisodes : trop peu pour conclure. Allongez la période ou ajoutez des paires.`; c = 'warn' }
-  else if (both && holds) {
-    msg = `Le détecteur apporte un avantage dans les deux sens, confirmé sur la période de validation${beatsSingle ? ', et l\'alignement 3/3 fait mieux qu\'une unité de temps seule' : ' (mais l\'alignement ne fait pas mieux qu\'une unité de temps seule)'}.`
-    c = 'good'
-  } else if (both) { msg = 'Avantage sur l\'ensemble, mais il ne se confirme pas sur la période de validation : prudence.'; c = 'warn' }
-  else { msg = 'Pas d\'avantage net et régulier dans les deux sens : le détecteur ne fait pas mieux que le hasard ici.'; c = 'bad' }
-  return <p className={`verdict ${c}`}>{msg}</p>
+function Verdict({ vars, h }: { vars: { id: string; name: string; pooled: Record<string, Record<string, GroupStats>> }[]; h: string }) {
+  const real = (g?: GroupStats) => !!g && g.edge_hit != null && g.ci != null && g.edge_hit > g.ci
+  const neg = (g?: GroupStats) => !!g && g.edge_hit != null && g.ci != null && g.edge_hit < -g.ci
+  const good = vars.filter((v) => real(v.pooled[h]?.aligned) && (v.pooled[h]?.aligned?.out_of_sample?.edge_hit ?? 0) > 0)
+  const pb = vars.filter((v) => real(v.pooled[h]?.pb_with) && (v.pooled[h]?.pb_with?.out_of_sample?.edge_hit ?? 0) > 0)
+  const bad = vars.filter((v) => neg(v.pooled[h]?.aligned))
+  const parts: string[] = []
+  let c = 'bad'
+  if (good.length) { parts.push(`Tendance confirmée utile (au-delà de la marge, et tenue en validation) : ${good.map((v) => v.id).join(', ')}.`); c = 'good' }
+  if (pb.length) { parts.push(`Le repli dans le sens de la tendance a un avantage réel avec : ${pb.map((v) => v.id).join(', ')}.`); c = 'good' }
+  if (!good.length && !pb.length) {
+    if (bad.length) parts.push(`Aucune variante n'apporte d'avantage ; ${bad.map((v) => v.id).join(', ')} font même significativement moins bien que le hasard : sur cet horizon, le marché a tendance à revenir en arrière après un mouvement (comportement de range).`)
+    else parts.push('Aucune variante ne sort de la marge d\'erreur : pas d\'avantage démontré sur cet horizon. Plus de données (365 j, plus de paires) ou un autre horizon sont nécessaires.')
+    c = bad.length ? 'bad' : 'warn'
+  }
+  return <p className={`verdict ${c}`}>{parts.join(' ')}</p>
 }

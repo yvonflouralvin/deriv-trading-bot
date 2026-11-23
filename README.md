@@ -43,12 +43,20 @@ Deriv API ──ws──▶ collector (Python) ──▶ PostgreSQL / TimescaleD
 - **Stockage continu** des états (table `trend_states`), recalculés toutes les 30 s pour chaque actif suivi.
 - **Monitor** : onglet **Tendances** (tableau actifs × unités de temps, ajout rapide d'EUR/USD, GBP/USD, USD/JPY
   avec 1 an d'historique) et bande colorée sous le graphique (une ligne par unité de temps + alignement).
-- **Évaluation** (bouton « Évaluer ») : quand les unités de temps sont alignées, le prix part-il ensuite dans ce
-  sens plus souvent qu'à un instant quelconque ? Avantage vs référence, mouvement en ATR, MFE/MAE, nombre
-  d'épisodes, comparaison avec chaque unité de temps seule, stabilité, et validation sur les 30 % de données les
-  plus récentes.
-- Historique : les unités de temps ≥ 15 min sont chargées sur la profondeur demandée (jusqu'à 365 jours) ;
-  les plus petites sont plafonnées à `SHORT_TF_MAX_DAYS` (30 jours).
+- **Évaluation — comparateur de variantes** (bouton « Évaluer ») : 5 variantes du détecteur
+  (`services/engine/analysis/variants.py`) comparées sur les mêmes données :
+  A actuel · B rapide (pivots fractals, EMA 20/50, ADX montant) · C rôles (H4 = biais) · D trio H1/M15/M5 ·
+  E rapide + rôles. Pour chacune :
+  - avantage de la tendance confirmée vs référence, **± marge d'erreur à 95 %** (calculée sur les épisodes),
+    et validation sur les 30 % de données les plus récentes ;
+  - **retard** : sur les vrais grands mouvements (repérés après coup), heures avant confirmation, part du
+    mouvement déjà faite, mouvements manqués ;
+  - **phases** de la tendance (naissante / mature / étendue) ;
+  - **test du repli** : un repli du RSI de la petite UT dans le sens de la tendance des 2 grandes UT repart-il
+    dans ce sens ? (comparé aux replis hors tendance et à contre-tendance) ;
+  - unités de temps seules, stabilité, verdict automatique.
+- Historique : les unités de temps ≥ 5 min sont chargées sur la profondeur demandée (jusqu'à 365 jours) ;
+  la M1 est plafonnée à `SHORT_TF_MAX_DAYS` (30 jours).
 
 ## Moteur de stratégie
 
