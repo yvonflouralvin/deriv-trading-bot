@@ -4,6 +4,7 @@ import { api, auth, AuthError, type BacktestTrade, type CollectorStatus, type Ti
 import Chart, { type ActiveStrategy } from './Chart'
 import Sidebar from './Sidebar'
 import StrategiesPanel from './Strategies'
+import TrendsPanel from './Trends'
 import { DrawBar, TopBar } from './Toolbar'
 
 const PREFS = 'monitor.prefs'
@@ -12,13 +13,14 @@ interface Prefs {
   tf: number
   strategies: ActiveStrategy[]
   magnet: boolean
-  tab: 'watchlist' | 'strategies'
+  tab: 'watchlist' | 'trends' | 'strategies'
   showTrades: boolean
+  trendBand: boolean
 }
 type Overlay = { label: string; symbol: string; tf: number; trades: BacktestTrade[] }
 
 function loadPrefs(): Prefs {
-  const def: Prefs = { symbol: 'R_100', tf: 60, strategies: [], magnet: true, tab: 'watchlist', showTrades: true }
+  const def: Prefs = { symbol: 'R_100', tf: 60, strategies: [], magnet: true, tab: 'watchlist', showTrades: true, trendBand: true }
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(PREFS) ?? '{}') }
   } catch {
@@ -61,6 +63,7 @@ export default function App() {
   const [toast, setToast] = useState('')
   const [status, setStatus] = useState<Record<string, CollectorStatus>>({})
   const [overlay, setOverlay] = useState<Overlay | null>(null)
+  const [trendTfs, setTrendTfs] = useState<Timeframe[]>([])
 
   const update = (patch: Partial<Prefs>) => setPrefs((p) => ({ ...p, ...patch }))
   useEffect(() => localStorage.setItem(PREFS, JSON.stringify(prefs)), [prefs])
@@ -74,7 +77,11 @@ export default function App() {
 
   const start = () => {
     api.timeframes()
-      .then((tfs) => { setTimeframes(tfs); setReady('ok') })
+      .then((tfs) => {
+        setTimeframes(tfs)
+        setReady('ok')
+        api.trendConfig().then((c) => setTrendTfs(c.tfs)).catch(() => {})
+      })
       .catch((e) => (e instanceof AuthError ? setReady('login') : onError(e)))
   }
   useEffect(start, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -107,6 +114,8 @@ export default function App() {
       <DrawBar {...barProps} />
       <main className="main">
         <div className="chart-flags">
+          <button className={prefs.trendBand ? 'on' : ''} onClick={() => update({ trendBand: !prefs.trendBand })}
+                  title="Bande de tendance multi-timeframe sous le graphique">Tendances</button>
           <button className={prefs.showTrades ? 'on' : ''} onClick={() => update({ showTrades: !prefs.showTrades })}
                   title="Afficher les trades du moteur (P = paper, D = démo)">Trades du moteur</button>
           {overlay && (
@@ -126,6 +135,8 @@ export default function App() {
           clearToken={clearToken}
           overlay={overlay}
           showTrades={prefs.showTrades}
+          trendBand={prefs.trendBand}
+          trendTfs={trendTfs}
           onToolDone={() => setTool(null)}
           onLive={setLive}
           onError={onError}
@@ -134,9 +145,12 @@ export default function App() {
       <aside className="sidebar">
         <div className="tabs">
           <button className={prefs.tab === 'watchlist' ? 'on' : ''} onClick={() => update({ tab: 'watchlist' })}>Watchlist</button>
+          <button className={prefs.tab === 'trends' ? 'on' : ''} onClick={() => update({ tab: 'trends' })}>Tendances</button>
           <button className={prefs.tab === 'strategies' ? 'on' : ''} onClick={() => update({ tab: 'strategies' })}>Stratégies</button>
         </div>
-        {prefs.tab === 'watchlist' ? (
+        {prefs.tab === 'trends' ? (
+          <TrendsPanel selected={prefs.symbol} trendTfs={trendTfs} onSelect={(symbol) => update({ symbol })} onError={onError} />
+        ) : prefs.tab === 'watchlist' ? (
           <Sidebar selected={prefs.symbol} onSelect={(symbol) => update({ symbol })} onError={onError}
                    status={status.collector ?? null} />
         ) : (

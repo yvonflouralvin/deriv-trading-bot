@@ -14,7 +14,9 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { DrawingManager, type DrawingKind } from 'lightweight-charts-drawing'
-import { api, LiveFeed, type BacktestTrade, type Candle, type LiveMessage, type Trade } from './api'
+import {
+  api, LiveFeed, type BacktestTrade, type Candle, type LiveMessage, type Timeframe, type Trade, type TrendSeries,
+} from './api'
 import { STRATEGIES } from './strategies'
 
 export interface ActiveStrategy {
@@ -32,6 +34,8 @@ interface Props {
   clearToken: number
   overlay: { label: string; symbol: string; tf: number; trades: BacktestTrade[] } | null
   showTrades: boolean
+  trendBand: boolean
+  trendTfs: Timeframe[]
   onToolDone: () => void
   onLive: (connected: boolean) => void
   onError: (e: unknown) => void
@@ -49,6 +53,9 @@ export default function Chart(p: Props) {
   const feed = useRef<LiveFeed | null>(null)
   const bars = useRef<Candle[]>([])
   const trades = useRef<Map<number, Trade>>(new Map())
+  const trendData = useRef<TrendSeries | null>(null)
+  const band = useRef<HTMLCanvasElement>(null)
+  const bandFrame = useRef(0)
   const view = useRef({ symbol: p.symbol, tf: p.tf, loading: false, exhausted: false, importing: false })
   const latest = useRef(p)
   latest.current = p
@@ -105,14 +112,20 @@ export default function Chart(p: Props) {
           s.setData(bars.current.map((b) => ({ ...b, time: t(b.time) })))
           redrawStrategies()
           setCount(bars.current.length)
+          loadTrends(bars.current[0].time)
         })
         .catch(latest.current.onError)
         .finally(() => { v.loading = false })
     })
 
+    c.timeScale().subscribeVisibleLogicalRangeChange(scheduleBand)
+    const ro = new ResizeObserver(scheduleBand)
+    ro.observe(box.current!)
+
     feed.current = new LiveFeed(onLive, (ok) => latest.current.onLive(ok))
 
     return () => {
+      ro.disconnect()
       feed.current?.close()
       dm.destroy()
       c.remove()
@@ -136,6 +149,7 @@ export default function Chart(p: Props) {
     else b.push(m.candle)
     series.current.update({ ...m.candle, time: t(m.candle.time) })
     redrawStrategies()
+    scheduleBand()
     setLegend((cur) => (cur && cur.time !== m.candle.time ? cur : m.candle))
   }
 
@@ -147,6 +161,7 @@ export default function Chart(p: Props) {
     v.exhausted = false
     bars.current = []
     trades.current = new Map()
+    trendData.current = null
     series.current?.setData([])
     feed.current?.subscribe(p.symbol, p.tf)
     drawings.current?.setInterval(p.tfLabel)
@@ -161,6 +176,7 @@ export default function Chart(p: Props) {
         setLegend(candles[candles.length - 1] ?? null)
         setCount(candles.length)
         redrawStrategies()
+        if (candles.length) loadTrends(candles[0].time)
         if (candles.length) {
           api.trades({ symbol: p.symbol, since: candles[0].time, limit: 2000 }).then((ts) => {
             if (cancelled) return
@@ -181,6 +197,109 @@ export default function Chart(p: Props) {
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [p.symbol, p.tf])
+
+  // ---- bande de tendance multi-timeframe ------------------------------------------
+  function loadTrends(since?: number) {
+    const v = view.current
+    if (!latest.current.trendBand) { scheduleBand(); return }
+    const sym = v.symbol
+    api.trends(sym, since ?? bars.current[0]?.time).then((d) => {
+      if (sym !== view.current.symbol) return
+      trendData.current = d
+      scheduleBand()
+    }).catch(latest.current.onError)
+  }
+
+  useEffect(() => {
+    chart.current?.priceScale('right').applyOptions({
+      scaleMargins: { top: 0.08, bottom: p.trendBand ? 0.22 : 0.08 },
+    })
+    loadTrends()
+    if (!p.trendBand) return
+    const id = window.setInterval(() => loadTrends(), 60_000)
+    return () => window.clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [p.trendBand, p.symbol, p.tf])
+
+  function scheduleBand() {
+    cancelAnimationFrame(bandFrame.current)
+    bandFrame.current = requestAnimationFrame(drawBand)
+  }
+
+  function drawBand() {
+    const c = chart.current, cv = band.current, el = box.current
+    const L = latest.current
+    if (!c || !cv || !el) return
+    const data = trendData.current
+    const show = L.trendBand && !!data && bars.current.length > 0
+    cv.style.display = show ? 'block' : 'none'
+    if (!show || !data) return
+    const ts = c.timeScale()
+    const tfs = [...data.tfs].sort((a, b) => b - a)
+    const rowH = 7, gap = 2, labelW = 34
+    const rows = tfs.length + 1
+    const W = Math.max(0, el.clientWidth - c.priceScale('right').width())
+    const H = rows * (rowH + gap) + gap
+    const dpr = window.devicePixelRatio || 1
+    cv.style.bottom = `${ts.height() + 34}px`   // au-dessus du logo TradingView (attribution)
+    cv.style.width = `${W}px`
+    cv.style.height = `${H}px`
+    cv.width = Math.round(W * dpr)
+    cv.height = Math.round(H * dpr)
+    const ctx = cv.getContext('2d')!
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, W, H)
+    ctx.fillStyle = 'rgba(19, 23, 34, 0.85)'
+    ctx.fillRect(0, 0, W, H)
+
+    // état en vigueur à l'instant t = dernière bougie clôturée de chaque unité de temps
+    const series = tfs.map((tf) => {
+      const arr = data.states[String(tf)] ?? []
+      return { tf, closes: arr.map((x) => x[0] + tf), arr }
+    })
+    const at = (k: number, t: number) => {
+      const { closes, arr } = series[k]
+      let lo = 0, hi = closes.length - 1, idx = -1
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (closes[mid] <= t) { idx = mid; lo = mid + 1 } else hi = mid - 1
+      }
+      return idx >= 0 ? arr[idx] : null
+    }
+    const range = ts.getVisibleLogicalRange()
+    if (!range) return
+    const b = bars.current
+    const tf = view.current.tf
+    const spacing = Math.max(1, ts.options().barSpacing)
+    const color = (state: number, strength: number) => {
+      const a = (0.35 + 0.65 * Math.min(100, strength) / 100).toFixed(2)
+      return state > 0 ? `rgba(38,166,154,${a})` : state < 0 ? `rgba(239,83,80,${a})` : 'rgba(120,123,134,0.35)'
+    }
+    for (let i = Math.max(0, Math.floor(range.from)); i <= Math.min(b.length - 1, Math.ceil(range.to)); i++) {
+      const x = ts.logicalToCoordinate(i as never)
+      if (x == null) continue
+      const tClose = b[i].time + tf
+      const st = series.map((_, k) => at(k, tClose))
+      st.forEach((s, k) => {
+        if (!s) return
+        ctx.fillStyle = color(s[1], s[2])
+        ctx.fillRect(x - spacing / 2, gap + k * (rowH + gap), spacing + 0.5, rowH)
+      })
+      if (st.every((s) => s && s[1] === 1) || st.every((s) => s && s[1] === -1)) {
+        ctx.fillStyle = st[0]![1] > 0 ? '#26a69a' : '#ef5350'
+        ctx.fillRect(x - spacing / 2, gap + tfs.length * (rowH + gap), spacing + 0.5, rowH)
+      }
+    }
+    // étiquettes
+    ctx.fillStyle = 'rgba(19, 23, 34, 0.9)'
+    ctx.fillRect(0, 0, labelW, H)
+    ctx.font = '9px sans-serif'
+    ctx.fillStyle = '#9598a1'
+    ctx.textBaseline = 'middle'
+    const label = (tf: number) => L.trendTfs.find((x) => x.tf === tf)?.label ?? `${tf / 60}m`
+    tfs.forEach((tf, k) => ctx.fillText(label(tf), 4, gap + k * (rowH + gap) + rowH / 2))
+    ctx.fillText('Align.', 4, gap + tfs.length * (rowH + gap) + rowH / 2)
+  }
 
   // ---- outils de dessin --------------------------------------------------------
   useEffect(() => { drawings.current?.setTool(p.tool) }, [p.tool])
@@ -262,6 +381,7 @@ export default function Chart(p: Props) {
         <span className="muted"> · {count} bougies</span>
       </div>
       <div ref={box} className="chart" />
+      <canvas ref={band} className="trend-band" />
     </div>
   )
 }

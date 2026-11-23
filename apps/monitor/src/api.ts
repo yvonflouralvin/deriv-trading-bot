@@ -153,6 +153,72 @@ export interface Backtest {
   created_at: number
 }
 
+export interface TrendNow {
+  symbol: string
+  display_name: string
+  backfill_days: number
+  states: Record<string, { state: number; strength: number; adx: number | null; time: number }>
+  align: number | null
+  strength: number | null
+}
+
+export interface TrendSeries {
+  tfs: number[]
+  states: Record<string, [number, number, number][]>   // [début de bougie, état, force]
+}
+
+export interface GroupStats {
+  n: number
+  share?: number | null
+  pct_up?: number | null
+  mean_fwd?: number | null
+  hit?: number | null
+  edge_hit?: number | null
+  mean_dir?: number | null
+  edge_move?: number | null
+  mfe?: number | null
+  mae?: number | null
+  mfe_mae?: number | null
+  episodes?: number
+  episode_hit?: number | null
+  in_sample?: GroupStats
+  out_of_sample?: GroupStats
+}
+
+export interface Stability {
+  bars: number
+  share_up: number
+  share_down: number
+  share_neutral: number
+  flips_per_day: number
+  median_run_hours: number
+  mean_strength: number
+}
+
+export interface SymbolReport {
+  symbol: string
+  samples: number
+  first_candle: number
+  horizons: Record<string, Record<string, GroupStats>>
+  stability: Record<string, Stability>
+}
+
+export interface TrendReport {
+  id: number
+  symbols: string[]
+  tfs: number[]
+  days: number
+  status: 'pending' | 'running' | 'done' | 'error'
+  error: string | null
+  created_at: number
+  result: {
+    symbols: SymbolReport[]
+    pooled: Record<string, Record<string, GroupStats>>
+    missing: string[]
+    horizons: number[]
+  } | null
+}
+
 const BASE = import.meta.env.VITE_API_URL ?? ''
 const TOKEN_KEY = 'monitor.token'
 
@@ -209,6 +275,14 @@ export const api = {
     call<{ id: number }>('/backtests', { method: 'POST', body: JSON.stringify({ strategy_id, days }) }),
   backtests: (strategy_id: number) => call<Backtest[]>(`/backtests?strategy_id=${strategy_id}&limit=10`),
   backtest: (id: number) => call<Backtest>(`/backtests/${id}`),
+  trendConfig: () => call<{ tfs: Timeframe[] }>('/trend-config'),
+  trends: (symbol: string, since?: number) =>
+    call<TrendSeries>(`/trends?symbol=${encodeURIComponent(symbol)}${since ? `&since=${since}` : ''}`),
+  trendsNow: () => call<TrendNow[]>('/trends/current'),
+  runTrendReport: (symbols: string[], days: number) =>
+    call<{ id: number }>('/trend-reports', { method: 'POST', body: JSON.stringify({ symbols, days }) }),
+  trendReport: (id: number) => call<TrendReport>(`/trend-reports/${id}`),
+  trendReports: () => call<TrendReport[]>('/trend-reports'),
 }
 
 export type LiveMessage =
