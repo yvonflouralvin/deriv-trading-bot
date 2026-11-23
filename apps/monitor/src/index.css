@@ -179,3 +179,32 @@ legend { color: var(--muted); font-size: 11px; text-transform: uppercase; letter
 .bt-history li { display: flex; justify-content: space-between; padding: 6px 4px; cursor: pointer; font-size: 12px; border-radius: 4px; }
 .bt-history li:hover, .bt-history li.on { background: #2a2e39; }
 .warn { border-left: 2px solid #ffb74d; padding-left: 8px; margin: 0; }
+.trend-band { position: absolute; left: 0; z-index: 2; pointer-events: none; display: none; }
+
+/* ---- tendances ----------------------------------------------------------- */
+.quick-add { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.quick-add .muted { width: 100%; }
+.quick-add button { border-color: var(--border); font-size: 12px; }
+.trend-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.trend-table th { color: var(--muted); font-weight: 500; text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+.trend-table td { padding: 8px 6px; border-bottom: 1px solid #1a1e29; white-space: nowrap; }
+.trend-table tbody tr { cursor: pointer; }
+.trend-table tbody tr:hover { background: #2a2e39; }
+.trend-table tr.active { background: rgba(41, 98, 255, 0.12); }
+.t-name { max-width: 110px; overflow: hidden; text-overflow: ellipsis; }
+.cell small { color: var(--muted); }
+.align { font-weight: 600; }
+.legend-note { padding: 10px 12px; line-height: 1.4; margin: 0; }
+.sym-pick { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.report { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.report th { color: var(--muted); font-weight: 500; text-align: right; padding: 5px 6px; border-bottom: 1px solid var(--border); }
+.report th:first-child, .report td:first-child { text-align: left; }
+.report td { text-align: right; padding: 5px 6px; border-bottom: 1px solid #1a1e29; }
+.report tr.strong td { font-weight: 600; background: rgba(41, 98, 255, 0.06); }
+.verdict { margin: 0; padding: 8px 10px; border-radius: 6px; line-height: 1.4; }
+.verdict.good { background: rgba(38, 166, 154, 0.14); border: 1px solid #26a69a66; }
+.verdict.warn { background: rgba(255, 152, 0, 0.12); border: 1px solid #ffb74d66; }
+.verdict.bad { background: rgba(239, 83, 80, 0.12); border: 1px solid #ef535066; }
+.howto summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.howto ul { margin: 6px 0 0; padding-left: 18px; line-height: 1.5; color: var(--text); }
+.modal { width: min(760px, 96vw); }

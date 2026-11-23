@@ -6,6 +6,7 @@ COPY services/engine/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY services/engine/*.py ./
 COPY services/engine/strategies ./strategies
+COPY services/engine/analysis ./analysis
 COPY shared/deriv.py ./
 COPY db/schema.sql ./schema.sql
 RUN useradd --create-home app

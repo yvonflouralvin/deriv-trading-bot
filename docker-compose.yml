@@ -55,6 +55,7 @@ services:
       DERIV_ACCOUNT_ID: ${DERIV_ACCOUNT_ID:-}
       # 0 = toutes les stratégies tournent en paper, même celles réglées en démo (interrupteur général)
       DEMO_TRADING_ENABLED: ${DEMO_TRADING_ENABLED:-1}
+      TREND_TFS: ${TREND_TFS:-14400,3600,900}
 
   api:
     build:
@@ -68,6 +69,7 @@ services:
       DATABASE_URL: postgresql://trading:${POSTGRES_PASSWORD}@db:5432/trading
       API_TOKEN: ${API_TOKEN:?définir API_TOKEN (mot de passe du Monitor)}
       TIMEFRAMES: ${TIMEFRAMES:-60,300,900,3600,14400,86400}
+      TREND_TFS: ${TREND_TFS:-14400,3600,900}
     expose:
       - "8000"
 

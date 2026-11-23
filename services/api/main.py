@@ -526,3 +526,91 @@ async def get_backtest(bid: int):
     if not r:
         raise HTTPException(404, "Backtest introuvable")
     return _backtest_out(r, True)
+
+
+# --------------------------------------------------------------------------- #
+# Analyse : tendance multi-timeframe
+# --------------------------------------------------------------------------- #
+TREND_TFS = [int(x) for x in os.getenv("TREND_TFS", "14400,3600,900").split(",")]
+
+
+@app.get("/api/trend-config", dependencies=[Depends(auth)])
+async def trend_config():
+    return {"tfs": [{"tf": tf, "label": TF_LABELS.get(tf, f"{tf}s")} for tf in TREND_TFS]}
+
+
+@app.get("/api/trends", dependencies=[Depends(auth)])
+async def trends(symbol: str, since: int | None = None, limit: int = Query(20000, le=100000)):
+    """États par unité de temps : [[début de bougie, état, force], ...] (ordre chronologique)."""
+    out = {}
+    async with pool.acquire() as con:
+        for tf in TREND_TFS:
+            rows = await con.fetch("""
+                SELECT extract(epoch FROM ts)::bigint AS t, state, strength FROM trend_states
+                WHERE symbol=$1 AND tf=$2 AND ($3::bigint IS NULL OR ts >= to_timestamp($3) - make_interval(secs => $2 * 2))
+                ORDER BY ts DESC LIMIT $4""", symbol, tf, since, limit)
+            out[str(tf)] = [[r["t"], r["state"], r["strength"]] for r in reversed(rows)]
+    return {"tfs": TREND_TFS, "states": out}
+
+
+@app.get("/api/trends/current", dependencies=[Depends(auth)])
+async def trends_current():
+    async with pool.acquire() as con:
+        rows = await con.fetch("""
+            SELECT w.symbol, coalesce(s.display_name, w.symbol) AS display_name, w.backfill_days,
+                   ts.tf, ts.state, ts.strength, ts.adx, extract(epoch FROM ts.ts)::bigint AS t
+            FROM watchlist w
+            LEFT JOIN symbols s USING (symbol)
+            LEFT JOIN LATERAL (
+                SELECT DISTINCT ON (tf) tf, state, strength, adx, ts FROM trend_states x
+                WHERE x.symbol = w.symbol AND x.tf = ANY($1::int[]) ORDER BY tf, ts DESC) ts ON true
+            WHERE w.enabled ORDER BY w.symbol""", TREND_TFS)
+    by = {}
+    for r in rows:
+        d = by.setdefault(r["symbol"], {"symbol": r["symbol"], "display_name": r["display_name"],
+                                         "backfill_days": r["backfill_days"], "states": {}})
+        if r["tf"] is not None:
+            d["states"][str(r["tf"])] = {"state": r["state"], "strength": r["strength"], "adx": r["adx"],
+                                         "time": r["t"]}
+    for d in by.values():
+        vals = [d["states"].get(str(tf), {}).get("state") for tf in TREND_TFS]
+        d["align"] = None if None in vals else (1 if set(vals) == {1} else -1 if set(vals) == {-1} else 0)
+        d["strength"] = round(sum(d["states"][str(tf)]["strength"] for tf in TREND_TFS) / len(TREND_TFS)) \
+            if d["align"] is not None else None
+    return list(by.values())
+
+
+class TrendReportIn(BaseModel):
+    symbols: list[str] = Field(min_length=1, max_length=20)
+    days: int = Field(90, ge=7, le=365)
+
+
+@app.post("/api/trend-reports", dependencies=[Depends(auth)], status_code=201)
+async def create_trend_report(body: TrendReportIn):
+    async with pool.acquire() as con:
+        rid = await con.fetchval("INSERT INTO trend_reports(symbols, tfs, days) VALUES($1, $2, $3) RETURNING id",
+                                 body.symbols, TREND_TFS, body.days)
+    return {"id": rid}
+
+
+def _report_out(r, full: bool) -> dict:
+    d = dict(r)
+    d["result"] = _js(d["result"]) if full else None
+    d["created_at"], d["finished_at"] = _epoch(d["created_at"]), _epoch(d["finished_at"])
+    return d
+
+
+@app.get("/api/trend-reports", dependencies=[Depends(auth)])
+async def list_trend_reports(limit: int = Query(10, ge=1, le=100)):
+    async with pool.acquire() as con:
+        rows = await con.fetch("SELECT * FROM trend_reports ORDER BY id DESC LIMIT $1", limit)
+    return [_report_out(r, False) for r in rows]
+
+
+@app.get("/api/trend-reports/{rid}", dependencies=[Depends(auth)])
+async def get_trend_report(rid: int):
+    async with pool.acquire() as con:
+        r = await con.fetchrow("SELECT * FROM trend_reports WHERE id = $1", rid)
+    if not r:
+        raise HTTPException(404, "Rapport introuvable")
+    return _report_out(r, True)

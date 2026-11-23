@@ -200,3 +200,45 @@ DROP TRIGGER IF EXISTS backtests_created ON backtests;
 CREATE TRIGGER backtests_created
     AFTER INSERT ON backtests
     FOR EACH ROW EXECUTE FUNCTION notify_backtests();
+
+-- =========================================================================
+-- Analyse de marché : tendance multi-timeframe (étape 1)
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS trend_states (
+    symbol    text     NOT NULL,
+    tf        integer  NOT NULL,
+    ts        timestamptz NOT NULL,      -- début de la bougie clôturée
+    state     smallint NOT NULL,         -- -1 baissier / 0 neutre / +1 haussier
+    score     real     NOT NULL,
+    strength  smallint NOT NULL,         -- 0..100
+    adx       real,
+    structure smallint,
+    ema       smallint,
+    di        smallint,
+    version   smallint NOT NULL,
+    PRIMARY KEY (symbol, tf, ts)
+);
+
+CREATE TABLE IF NOT EXISTS trend_reports (
+    id          serial PRIMARY KEY,
+    symbols     text[]  NOT NULL,
+    tfs         integer[] NOT NULL,
+    days        integer NOT NULL,
+    status      text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'done', 'error')),
+    result      jsonb,
+    error       text,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    finished_at timestamptz
+);
+
+CREATE OR REPLACE FUNCTION notify_trend_reports() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify('trend_reports', NEW.id::text);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trend_reports_created ON trend_reports;
+CREATE TRIGGER trend_reports_created
+    AFTER INSERT ON trend_reports
+    FOR EACH ROW EXECUTE FUNCTION notify_trend_reports();

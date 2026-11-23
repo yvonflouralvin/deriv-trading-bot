@@ -34,6 +34,9 @@ TIMEFRAMES = [int(x) for x in os.getenv("TIMEFRAMES", "60,300,900,3600,14400,864
 DEFAULT_SYMBOLS = [s for s in os.getenv("DEFAULT_SYMBOLS", "R_100,R_75,1HZ100V").split(",") if s]
 CATALOG_REFRESH_S = int(os.getenv("CATALOG_REFRESH_HOURS", "6")) * 3600
 RETRY_FAILED_S = 300
+# Historique profond inutile (et coûteux) sur les petites unités de temps :
+# au-delà de SHORT_TF_MAX_DAYS jours, seules les UT >= 15 min sont chargées.
+SHORT_TF_MAX_DAYS = int(os.getenv("SHORT_TF_MAX_DAYS", "30"))
 HISTORY_PAGE = int(os.getenv("HISTORY_PAGE", "1000"))
 SCHEMA_FILE = Path(os.getenv("SCHEMA_FILE", Path(__file__).with_name("schema.sql")))
 
@@ -95,6 +98,8 @@ class Collector:
         self.client: DerivClient | None = None
         self.subs: dict[str, str] = {}               # actif -> id d'abonnement
         self.sub_symbol: dict[str, str] = {}         # id d'abonnement -> actif
+        self.sub_days: dict[str, int] = {}           # profondeur d'historique déjà demandée
+        self.deep_tried: set = set()                 # (actif, tf, jours) : historique ancien déjà tenté
         self.failed: dict[str, tuple[float, str]] = {}  # actif -> (réessai, raison)
         self.wake = asyncio.Event()
         self.stats = {"ticks": 0, "started": time.time()}
@@ -184,10 +189,25 @@ class Collector:
                 last = await con.fetchval(
                     "SELECT extract(epoch FROM max(ts))::bigint FROM candles WHERE symbol=$1 AND tf=$2",
                     symbol, tf)
-            start = now - max(days * 86400, 300 * tf)
+            tf_days = days if tf >= 900 else min(days, SHORT_TF_MAX_DAYS)
+            wanted = now - max(tf_days * 86400, 300 * tf)
+            got = 0
             if last:
-                start = max(start, int(last))  # incrémental : on repart de la dernière bougie
-            got = await self.fetch_candles(symbol, tf, start, now)
+                # incrémental : on repart de la dernière bougie connue
+                got += await self.fetch_candles(symbol, tf, max(wanted, int(last)), now)
+                # historique plus ancien demandé (ex. passage de 7 à 365 jours) : une seule tentative
+                async with self.pool.acquire() as con:
+                    first = await con.fetchval(
+                        "SELECT extract(epoch FROM min(ts))::bigint FROM candles WHERE symbol=$1 AND tf=$2", symbol, tf)
+                key = (symbol, tf, tf_days)
+                if first and first > wanted + tf and key not in self.deep_tried:
+                    self.deep_tried.add(key)
+                    older = await self.fetch_candles(symbol, tf, wanted, int(first) - 1)
+                    got += older
+                    if older:
+                        log.info("Historique ancien %s %ss : %d bougies", symbol, tf, older)
+            else:
+                got += await self.fetch_candles(symbol, tf, wanted, now)
             async with self.pool.acquire() as con:
                 row = await con.fetchrow(
                     "SELECT extract(epoch FROM ts)::bigint AS ts, open, high, low, close FROM candles "
@@ -238,6 +258,12 @@ class Collector:
 
         for sym, days in desired.items():
             if sym in self.subs:
+                if days > self.sub_days.get(sym, days):   # plus d'historique demandé depuis le Monitor
+                    try:
+                        await self.backfill(sym, days)
+                        self.sub_days[sym] = days
+                    except DerivError as e:
+                        log.warning("Historique %s : %s", sym, e)
                 continue
             retry_at, _ = self.failed.get(sym, (0, ""))
             if time.time() < retry_at:
@@ -247,6 +273,7 @@ class Collector:
                 resp = await self.client.send({"ticks": sym, "subscribe": 1})
                 self.subs[sym] = resp["subscription"]["id"]
                 self.sub_symbol[self.subs[sym]] = sym
+                self.sub_days[sym] = days
                 self.failed.pop(sym, None)
                 log.info("Collecte en direct : %s", sym)
             except DerivError as e:
@@ -277,6 +304,7 @@ class Collector:
     async def session(self):
         self.subs.clear()
         self.sub_symbol.clear()
+        self.sub_days.clear()
         self.client = DerivClient(on_stream=self.on_stream)
         await self.client.connect()
         try:

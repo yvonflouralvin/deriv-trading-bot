@@ -27,6 +27,7 @@ from pathlib import Path
 import asyncpg
 
 import backtest
+from analysis.service import TREND_TFS, AnalysisService
 from deriv import TOKEN, USE_NEW_API, DerivClient, DerivError
 from strategies import REGISTRY, Bar
 
@@ -500,13 +501,18 @@ async def main():
     await eng.load_strategies()
     log.info("Trading démo %s", "activé" if DEMO_TRADING_ENABLED else "DÉSACTIVÉ (tout en paper)")
 
+    analysis = AnalysisService(pool)
+    log.info("Analyse de tendance sur %s", ", ".join(f"{tf // 60} min" for tf in TREND_TFS))
+
     listener = await asyncpg.connect(DATABASE_URL)
     await listener.add_listener("market", eng.on_market)
     await listener.add_listener("strategies", lambda *_: eng.reload_needed.set())
     await listener.add_listener("backtests", lambda _c, _p, _ch, payload: eng.backtest_queue.put_nowait(int(payload)))
+    await listener.add_listener("trend_reports", lambda _c, _p, _ch, payload: analysis.reports.put_nowait(int(payload)))
 
     tasks = [asyncio.create_task(t) for t in
-             (eng.paper_resolver(), eng.backtest_worker(), eng.heartbeat(), eng.reloader())]
+             (eng.paper_resolver(), eng.backtest_worker(), eng.heartbeat(), eng.reloader(),
+              analysis.sync_loop(), analysis.report_worker())]
     await stop.wait()
     log.info("Arrêt demandé")
     for t in tasks:
