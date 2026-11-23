@@ -34,8 +34,13 @@ TIMEFRAMES = [int(x) for x in os.getenv("TIMEFRAMES", "60,300,900,3600,14400,864
 DEFAULT_SYMBOLS = [s for s in os.getenv("DEFAULT_SYMBOLS", "R_100,R_75,1HZ100V").split(",") if s]
 CATALOG_REFRESH_S = int(os.getenv("CATALOG_REFRESH_HOURS", "6")) * 3600
 RETRY_FAILED_S = 300
-HISTORY_PAGE = 5000
+HISTORY_PAGE = int(os.getenv("HISTORY_PAGE", "1000"))
 SCHEMA_FILE = Path(os.getenv("SCHEMA_FILE", Path(__file__).with_name("schema.sql")))
+
+
+def _pretty(code):
+    """'synthetic_index' -> 'Synthetic Index' (la nouvelle API ne donne plus les libellés)."""
+    return code.replace("_", " ").title() if code else None
 
 
 def utc(epoch: int) -> datetime:
@@ -89,6 +94,7 @@ class Collector:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=50_000)
         self.client: DerivClient | None = None
         self.subs: dict[str, str] = {}               # actif -> id d'abonnement
+        self.sub_symbol: dict[str, str] = {}         # id d'abonnement -> actif
         self.failed: dict[str, tuple[float, str]] = {}  # actif -> (réessai, raison)
         self.wake = asyncio.Event()
         self.stats = {"ticks": 0, "started": time.time()}
@@ -98,8 +104,13 @@ class Collector:
     def on_stream(self, msg: dict):
         if msg.get("msg_type") == "tick" and "tick" in msg:
             t = msg["tick"]
+            sym = (t.get("symbol") or t.get("underlying_symbol")
+                   or self.sub_symbol.get((msg.get("subscription") or {}).get("id")))
+            if not sym or t.get("epoch") is None or t.get("quote") is None:
+                log.debug("Tick ignoré : %s", msg)
+                return
             try:
-                self.queue.put_nowait((t["symbol"], int(t["epoch"]), float(t["quote"])))
+                self.queue.put_nowait((sym, int(t["epoch"]), float(t["quote"])))
             except asyncio.QueueFull:
                 log.error("File de ticks pleine : tick perdu")
 
@@ -135,13 +146,23 @@ class Collector:
     async def refresh_catalog(self):
         try:
             resp = await self.client.send({"active_symbols": "brief"}, timeout=60)
-        except DerivError as e:
+        except (DerivError, asyncio.TimeoutError) as e:
             log.warning("Catalogue indisponible : %s", e)
             return
-        rows = [(s["symbol"], s.get("display_name") or s["symbol"], s.get("market"),
-                 s.get("market_display_name"), s.get("submarket_display_name"),
-                 s.get("pip"), bool(s.get("exchange_is_open")))
-                for s in resp.get("active_symbols", [])]
+        rows = []
+        for item in resp.get("active_symbols", []):
+            sym = item.get("underlying_symbol") or item.get("symbol")
+            if not sym:
+                continue
+            rows.append((
+                sym,
+                item.get("underlying_symbol_name") or item.get("display_name") or sym,
+                item.get("market"),
+                item.get("market_display_name") or _pretty(item.get("market")),
+                item.get("submarket_display_name") or _pretty(item.get("submarket")),
+                item.get("pip_size") or item.get("pip"),
+                bool(item.get("exchange_is_open")),
+            ))
         async with self.pool.acquire() as con:
             await con.executemany("""
                 INSERT INTO symbols(symbol, display_name, market, market_display,
@@ -186,12 +207,13 @@ class Collector:
             if not cs:
                 break
             rows = [(symbol, tf, utc(c["epoch"]), float(c["open"]), float(c["high"]),
-                     float(c["low"]), float(c["close"])) for c in cs]
+                     float(c["low"]), float(c["close"]))
+                    for c in cs if None not in (c.get("open"), c.get("high"), c.get("low"), c.get("close"))]
             async with self.pool.acquire() as con:
                 await upsert_candles(con, rows)
             total += len(rows)
             oldest = int(cs[0]["epoch"])
-            if oldest <= start or len(cs) < HISTORY_PAGE:
+            if oldest <= start or oldest >= cursor:
                 break
             cursor = oldest - 1
         return total
@@ -224,6 +246,7 @@ class Collector:
                 await self.backfill(sym, days)
                 resp = await self.client.send({"ticks": sym, "subscribe": 1})
                 self.subs[sym] = resp["subscription"]["id"]
+                self.sub_symbol[self.subs[sym]] = sym
                 self.failed.pop(sym, None)
                 log.info("Collecte en direct : %s", sym)
             except DerivError as e:
@@ -253,6 +276,7 @@ class Collector:
     # ---- session ---------------------------------------------------------- #
     async def session(self):
         self.subs.clear()
+        self.sub_symbol.clear()
         self.client = DerivClient(on_stream=self.on_stream)
         await self.client.connect()
         try:
@@ -325,12 +349,16 @@ async def main():
             started = time.monotonic()
             try:
                 await col.session()
+            except asyncio.CancelledError:
+                raise
             except (ConnectionError, OSError, asyncio.TimeoutError, DerivError) as e:
                 if time.monotonic() - started > 120:
                     delay = 5
                 log.warning("Session Deriv terminée (%s). Reconnexion dans %ds", e, delay)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 300)
+            except Exception:  # noqa: BLE001 — bug inattendu : on le journalise et on repart
+                log.exception("Erreur inattendue dans la session Deriv. Reconnexion dans %ds", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
 
     runner = asyncio.create_task(run_sessions())
     await stop.wait()
