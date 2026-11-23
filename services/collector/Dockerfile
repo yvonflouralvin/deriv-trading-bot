@@ -5,6 +5,7 @@ WORKDIR /app
 COPY services/collector/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY services/collector/*.py ./
+COPY shared/deriv.py ./
 COPY db/schema.sql ./schema.sql
 RUN useradd --create-home app
 USER app

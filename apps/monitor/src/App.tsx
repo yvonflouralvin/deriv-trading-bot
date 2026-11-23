@@ -1,15 +1,24 @@
 import { useEffect, useState } from 'react'
 import type { DrawingKind } from 'lightweight-charts-drawing'
-import { api, auth, AuthError, type Timeframe } from './api'
+import { api, auth, AuthError, type BacktestTrade, type CollectorStatus, type Timeframe } from './api'
 import Chart, { type ActiveStrategy } from './Chart'
 import Sidebar from './Sidebar'
+import StrategiesPanel from './Strategies'
 import { DrawBar, TopBar } from './Toolbar'
 
 const PREFS = 'monitor.prefs'
-interface Prefs { symbol: string; tf: number; strategies: ActiveStrategy[]; magnet: boolean }
+interface Prefs {
+  symbol: string
+  tf: number
+  strategies: ActiveStrategy[]
+  magnet: boolean
+  tab: 'watchlist' | 'strategies'
+  showTrades: boolean
+}
+type Overlay = { label: string; symbol: string; tf: number; trades: BacktestTrade[] }
 
 function loadPrefs(): Prefs {
-  const def: Prefs = { symbol: 'R_100', tf: 60, strategies: [], magnet: true }
+  const def: Prefs = { symbol: 'R_100', tf: 60, strategies: [], magnet: true, tab: 'watchlist', showTrades: true }
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(PREFS) ?? '{}') }
   } catch {
@@ -50,6 +59,8 @@ export default function App() {
   const [live, setLive] = useState(false)
   const [clearToken, setClearToken] = useState(0)
   const [toast, setToast] = useState('')
+  const [status, setStatus] = useState<Record<string, CollectorStatus>>({})
+  const [overlay, setOverlay] = useState<Overlay | null>(null)
 
   const update = (patch: Partial<Prefs>) => setPrefs((p) => ({ ...p, ...patch }))
   useEffect(() => localStorage.setItem(PREFS, JSON.stringify(prefs)), [prefs])
@@ -67,6 +78,14 @@ export default function App() {
       .catch((e) => (e instanceof AuthError ? setReady('login') : onError(e)))
   }
   useEffect(start, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (ready !== 'ok') return
+    const poll = () => api.status().then(setStatus).catch(() => setStatus({}))
+    poll()
+    const id = window.setInterval(poll, 5000)
+    return () => window.clearInterval(id)
+  }, [ready])
 
   if (ready === 'loading') return <div className="center muted">Connexion…</div>
   if (ready === 'login') return <Login onDone={start} />
@@ -87,6 +106,16 @@ export default function App() {
       <TopBar {...barProps} />
       <DrawBar {...barProps} />
       <main className="main">
+        <div className="chart-flags">
+          <button className={prefs.showTrades ? 'on' : ''} onClick={() => update({ showTrades: !prefs.showTrades })}
+                  title="Afficher les trades du moteur (P = paper, D = démo)">Trades du moteur</button>
+          {overlay && (
+            <span className="flag">
+              {overlay.label} · {overlay.trades.length} trades
+              <button onClick={() => setOverlay(null)} title="Masquer">✕</button>
+            </span>
+          )}
+        </div>
         <Chart
           symbol={prefs.symbol}
           tf={prefs.tf}
@@ -95,12 +124,33 @@ export default function App() {
           magnet={prefs.magnet}
           strategies={prefs.strategies}
           clearToken={clearToken}
+          overlay={overlay}
+          showTrades={prefs.showTrades}
           onToolDone={() => setTool(null)}
           onLive={setLive}
           onError={onError}
         />
       </main>
-      <Sidebar selected={prefs.symbol} onSelect={(symbol) => update({ symbol })} onError={onError} />
+      <aside className="sidebar">
+        <div className="tabs">
+          <button className={prefs.tab === 'watchlist' ? 'on' : ''} onClick={() => update({ tab: 'watchlist' })}>Watchlist</button>
+          <button className={prefs.tab === 'strategies' ? 'on' : ''} onClick={() => update({ tab: 'strategies' })}>Stratégies</button>
+        </div>
+        {prefs.tab === 'watchlist' ? (
+          <Sidebar selected={prefs.symbol} onSelect={(symbol) => update({ symbol })} onError={onError}
+                   status={status.collector ?? null} />
+        ) : (
+          <StrategiesPanel
+            symbol={prefs.symbol}
+            tf={prefs.tf}
+            timeframes={timeframes}
+            engineAlive={status.engine ? Boolean(status.engine.alive) : null}
+            onFocus={(symbol, tf) => update({ symbol, tf })}
+            onOverlay={setOverlay}
+            onError={onError}
+          />
+        )}
+      </aside>
       {toast && <div className="toast">{toast}</div>}
     </div>
   )

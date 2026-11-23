@@ -5,17 +5,16 @@ interface Props {
   selected: string
   onSelect: (symbol: string) => void
   onError: (e: unknown) => void
+  status: CollectorStatus | null
 }
 
-export default function Sidebar({ selected, onSelect, onError }: Props) {
+export default function Sidebar({ selected, onSelect, onError, status }: Props) {
   const [items, setItems] = useState<WatchItem[]>([])
-  const [status, setStatus] = useState<CollectorStatus | null>(null)
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<SymbolInfo[]>([])
 
   const refresh = () => {
     api.watchlist().then(setItems).catch(onError)
-    api.status().then((s) => setStatus(s.collector ?? null)).catch(() => setStatus(null))
   }
 
   useEffect(() => {
@@ -50,7 +49,7 @@ export default function Sidebar({ selected, onSelect, onError }: Props) {
 
   const live = status?.alive && status.connected
   return (
-    <aside className="sidebar">
+    <div className="panel">
       <div className="side-head">
         <span className={`dot ${live ? 'ok' : 'ko'}`} />
         Collecteur {status ? (live ? 'actif' : status.alive ? 'déconnecté de Deriv' : 'arrêté') : 'inconnu'}
@@ -109,6 +108,6 @@ export default function Sidebar({ selected, onSelect, onError }: Props) {
         })}
         {!items.length && <li className="muted">Aucun actif suivi. Ajoutez-en un ci-dessus.</li>}
       </ul>
-    </aside>
+    </div>
   )
 }
