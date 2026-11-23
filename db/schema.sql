@@ -84,3 +84,119 @@ DROP TRIGGER IF EXISTS watchlist_changed ON watchlist;
 CREATE TRIGGER watchlist_changed
     AFTER INSERT OR UPDATE OR DELETE ON watchlist
     FOR EACH STATEMENT EXECUTE FUNCTION notify_watchlist();
+
+-- =========================================================================
+-- Moteur de stratégie (service 3)
+-- =========================================================================
+
+-- Types de stratégie disponibles (publiés par le moteur au démarrage)
+CREATE TABLE IF NOT EXISTS strategy_kinds (
+    kind        text PRIMARY KEY,
+    name        text NOT NULL,
+    description text NOT NULL DEFAULT '',
+    params      jsonb NOT NULL DEFAULT '[]'::jsonb,   -- [{key,label,default,min,max,step}]
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Instances configurées depuis le Monitor
+CREATE TABLE IF NOT EXISTS strategies (
+    id                 serial PRIMARY KEY,
+    name               text NOT NULL,
+    kind               text NOT NULL,
+    symbol             text NOT NULL,
+    tf                 integer NOT NULL,
+    params             jsonb NOT NULL DEFAULT '{}'::jsonb,
+    mode               text NOT NULL DEFAULT 'paper' CHECK (mode IN ('paper', 'demo')),
+    enabled            boolean NOT NULL DEFAULT false,
+    stake              double precision NOT NULL DEFAULT 1 CHECK (stake > 0),
+    duration           integer NOT NULL DEFAULT 5 CHECK (duration > 0),
+    duration_unit      text NOT NULL DEFAULT 't' CHECK (duration_unit IN ('t', 's', 'm')),
+    payout_ratio       double precision NOT NULL DEFAULT 0.95 CHECK (payout_ratio > 0),
+    max_trades_per_day integer NOT NULL DEFAULT 20 CHECK (max_trades_per_day > 0),
+    max_daily_loss     double precision NOT NULL DEFAULT 10 CHECK (max_daily_loss > 0),
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS signals (
+    id          bigserial PRIMARY KEY,
+    strategy_id integer REFERENCES strategies(id) ON DELETE CASCADE,
+    symbol      text NOT NULL,
+    tf          integer NOT NULL,
+    candle_ts   timestamptz NOT NULL,
+    side        text NOT NULL CHECK (side IN ('CALL', 'PUT')),
+    price       double precision NOT NULL,
+    action      text NOT NULL,            -- traded / skipped:<raison>
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS signals_strategy_idx ON signals (strategy_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS trades (
+    id            bigserial PRIMARY KEY,
+    strategy_id   integer REFERENCES strategies(id) ON DELETE CASCADE,
+    signal_id     bigint REFERENCES signals(id) ON DELETE SET NULL,
+    mode          text NOT NULL CHECK (mode IN ('paper', 'demo')),
+    symbol        text NOT NULL,
+    side          text NOT NULL CHECK (side IN ('CALL', 'PUT')),
+    stake         double precision NOT NULL,
+    payout        double precision,
+    duration      integer NOT NULL,
+    duration_unit text NOT NULL,
+    entry_time    timestamptz NOT NULL,
+    entry_spot    double precision,
+    exit_time     timestamptz,
+    exit_spot     double precision,
+    profit        double precision,
+    status        text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'won', 'lost', 'error')),
+    contract_id   text,
+    error         text,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS trades_strategy_idx ON trades (strategy_id, entry_time DESC);
+CREATE INDEX IF NOT EXISTS trades_symbol_idx ON trades (symbol, entry_time DESC);
+CREATE INDEX IF NOT EXISTS trades_open_idx ON trades (status) WHERE status = 'open';
+
+CREATE TABLE IF NOT EXISTS backtests (
+    id            serial PRIMARY KEY,
+    strategy_id   integer REFERENCES strategies(id) ON DELETE SET NULL,
+    kind          text NOT NULL,
+    symbol        text NOT NULL,
+    tf            integer NOT NULL,
+    params        jsonb NOT NULL DEFAULT '{}'::jsonb,
+    stake         double precision NOT NULL DEFAULT 1,
+    duration      integer NOT NULL DEFAULT 5,
+    duration_unit text NOT NULL DEFAULT 't',
+    payout_ratio  double precision NOT NULL DEFAULT 0.95,
+    date_from     timestamptz NOT NULL,
+    date_to       timestamptz NOT NULL,
+    status        text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'done', 'error')),
+    stats         jsonb,
+    trades        jsonb,
+    error         text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    finished_at   timestamptz
+);
+
+CREATE OR REPLACE FUNCTION notify_strategies() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify('strategies', 'changed');
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS strategies_changed ON strategies;
+CREATE TRIGGER strategies_changed
+    AFTER INSERT OR UPDATE OR DELETE ON strategies
+    FOR EACH STATEMENT EXECUTE FUNCTION notify_strategies();
+
+CREATE OR REPLACE FUNCTION notify_backtests() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify('backtests', NEW.id::text);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS backtests_created ON backtests;
+CREATE TRIGGER backtests_created
+    AFTER INSERT ON backtests
+    FOR EACH ROW EXECUTE FUNCTION notify_backtests();

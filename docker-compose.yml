@@ -1,6 +1,7 @@
 # Plateforme de trading — V1
 #   db        : PostgreSQL + TimescaleDB (ticks, bougies, watchlist, dessins)
 #   collector : Service 1 — collecte des ticks Deriv, construit les bougies
+#   engine    : Service 3 — moteur de stratégie (paper / démo) + backtests
 #   api       : FastAPI — REST + WebSocket temps réel pour le Monitor
 #   monitor   : Service 2 — interface web (nginx), seul service exposé
 #
@@ -38,6 +39,22 @@ services:
       DERIV_ACCOUNT_ID: ${DERIV_ACCOUNT_ID:-}
       DEFAULT_SYMBOLS: ${DEFAULT_SYMBOLS:-R_100,R_75,1HZ100V}
       TIMEFRAMES: ${TIMEFRAMES:-60,300,900,3600,14400,86400}
+
+  engine:
+    build:
+      context: .
+      dockerfile: services/engine/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://trading:${POSTGRES_PASSWORD}@db:5432/trading
+      DERIV_APP_ID: ${DERIV_APP_ID:?définir DERIV_APP_ID}
+      DERIV_TOKEN: ${DERIV_TOKEN:-}
+      DERIV_ACCOUNT_ID: ${DERIV_ACCOUNT_ID:-}
+      # 0 = toutes les stratégies tournent en paper, même celles réglées en démo (interrupteur général)
+      DEMO_TRADING_ENABLED: ${DEMO_TRADING_ENABLED:-1}
 
   api:
     build:

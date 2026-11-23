@@ -26,12 +26,15 @@ import json
 import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
@@ -57,6 +60,7 @@ class Hub:
     async def start(self):
         self.conn = await asyncpg.connect(DATABASE_URL)
         await self.conn.add_listener("market", self._on_notify)
+        await self.conn.add_listener("engine", self._on_engine)
 
     async def stop(self):
         if self.conn:
@@ -79,6 +83,15 @@ class Hub:
                              "candle": {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4]}})
             for msg in msgs:
                 asyncio.create_task(self._send(ws, msg))
+
+    def _on_engine(self, _conn, _pid, _channel, payload: str):
+        try:
+            ev = json.loads(payload)
+        except ValueError:
+            return
+        for ws, sub in list(self.clients.items()):
+            if sub.get("symbol") == ev.get("symbol"):
+                asyncio.create_task(self._send(ws, ev))
 
     async def _send(self, ws: WebSocket, msg: dict):
         try:
@@ -276,3 +289,240 @@ async def ws_endpoint(ws: WebSocket, token: str | None = None):
         pass
     finally:
         hub.clients.pop(ws, None)
+
+
+# --------------------------------------------------------------------------- #
+# Moteur de stratégie
+# --------------------------------------------------------------------------- #
+def _epoch(dt):
+    return int(dt.timestamp()) if dt else None
+
+
+def _js(v):
+    return json.loads(v) if isinstance(v, str) else v
+
+
+TODAY = "(date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')"
+
+
+@app.get("/api/strategy-kinds", dependencies=[Depends(auth)])
+async def strategy_kinds():
+    async with pool.acquire() as con:
+        rows = await con.fetch("SELECT kind, name, description, params FROM strategy_kinds ORDER BY name")
+    return [{**dict(r), "params": _js(r["params"])} for r in rows]
+
+
+class StrategyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    kind: str
+    symbol: str = Field(min_length=1, max_length=40)
+    tf: int
+    params: dict = {}
+    mode: Literal["paper", "demo"] = "paper"
+    enabled: bool = False
+    stake: float = Field(1, gt=0, le=10000)
+    duration: int = Field(5, ge=1, le=1440)
+    duration_unit: Literal["t", "s", "m"] = "t"
+    payout_ratio: float = Field(0.95, gt=0, le=10)
+    max_trades_per_day: int = Field(20, ge=1, le=10000)
+    max_daily_loss: float = Field(10, gt=0, le=1_000_000)
+
+
+class StrategyPatch(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=80)
+    symbol: str | None = None
+    tf: int | None = None
+    params: dict | None = None
+    mode: Literal["paper", "demo"] | None = None
+    enabled: bool | None = None
+    stake: float | None = Field(None, gt=0, le=10000)
+    duration: int | None = Field(None, ge=1, le=1440)
+    duration_unit: Literal["t", "s", "m"] | None = None
+    payout_ratio: float | None = Field(None, gt=0, le=10)
+    max_trades_per_day: int | None = Field(None, ge=1, le=10000)
+    max_daily_loss: float | None = Field(None, gt=0, le=1_000_000)
+
+
+async def _check_strategy(con, kind: str | None, tf: int | None):
+    if kind is not None and not await con.fetchval("SELECT 1 FROM strategy_kinds WHERE kind=$1", kind):
+        raise HTTPException(400, f"Type de stratégie inconnu : {kind} (le moteur est-il démarré ?)")
+    if tf is not None and tf not in TIMEFRAMES:
+        raise HTTPException(400, f"Unité de temps non collectée : {tf}")
+
+
+async def _ensure_watched(con, symbol: str):
+    """Une stratégie active a besoin des données de son actif."""
+    await con.execute("""INSERT INTO watchlist(symbol) VALUES($1)
+                         ON CONFLICT (symbol) DO UPDATE SET enabled = true""", symbol)
+
+
+STRATEGY_SQL = f"""
+    SELECT s.*, k.name AS kind_name,
+      coalesce(d.n, 0) AS today_trades, coalesce(d.pnl, 0) AS today_pnl, coalesce(d.wins, 0) AS today_wins,
+      coalesce(a.n, 0) AS total_trades, coalesce(a.pnl, 0) AS total_pnl, coalesce(a.wins, 0) AS total_wins,
+      coalesce(a.open, 0) AS open_trades, coalesce(a.errors, 0) AS errors
+    FROM strategies s
+    LEFT JOIN strategy_kinds k ON k.kind = s.kind
+    LEFT JOIN LATERAL (SELECT count(*) FILTER (WHERE status IN ('won','lost')) n, sum(profit) pnl,
+                              count(*) FILTER (WHERE status='won') wins
+                       FROM trades t WHERE t.strategy_id = s.id AND t.entry_time >= {TODAY}) d ON true
+    LEFT JOIN LATERAL (SELECT count(*) FILTER (WHERE status IN ('won','lost')) n, sum(profit) pnl,
+                              count(*) FILTER (WHERE status='won') wins,
+                              count(*) FILTER (WHERE status='open') open,
+                              count(*) FILTER (WHERE status='error') errors
+                       FROM trades t WHERE t.strategy_id = s.id) a ON true
+"""
+
+
+def _strategy_out(r) -> dict:
+    d = dict(r)
+    d["params"] = _js(d["params"])
+    d["created_at"], d["updated_at"] = _epoch(d["created_at"]), _epoch(d["updated_at"])
+    return d
+
+
+@app.get("/api/strategies", dependencies=[Depends(auth)])
+async def list_strategies(symbol: str | None = None):
+    async with pool.acquire() as con:
+        rows = await con.fetch(STRATEGY_SQL + " WHERE $1::text IS NULL OR s.symbol = $1 ORDER BY s.id", symbol)
+    return [_strategy_out(r) for r in rows]
+
+
+@app.post("/api/strategies", dependencies=[Depends(auth)], status_code=201)
+async def create_strategy(body: StrategyIn):
+    async with pool.acquire() as con, con.transaction():
+        await _check_strategy(con, body.kind, body.tf)
+        sid = await con.fetchval("""
+            INSERT INTO strategies(name, kind, symbol, tf, params, mode, enabled, stake, duration, duration_unit,
+                                   payout_ratio, max_trades_per_day, max_daily_loss)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id""",
+            body.name, body.kind, body.symbol, body.tf, json.dumps(body.params), body.mode, body.enabled,
+            body.stake, body.duration, body.duration_unit, body.payout_ratio, body.max_trades_per_day,
+            body.max_daily_loss)
+        await _ensure_watched(con, body.symbol)
+        row = await con.fetchrow(STRATEGY_SQL + " WHERE s.id = $1", sid)
+    return _strategy_out(row)
+
+
+@app.patch("/api/strategies/{sid}", dependencies=[Depends(auth)])
+async def patch_strategy(sid: int, body: StrategyPatch):
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(400, "Rien à modifier")
+    async with pool.acquire() as con, con.transaction():
+        await _check_strategy(con, None, fields.get("tf"))
+        if "params" in fields:
+            fields["params"] = json.dumps(fields["params"])
+        sets = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(fields))
+        row = await con.fetchrow(f"UPDATE strategies SET {sets}, updated_at = now() WHERE id = $1 RETURNING symbol, enabled",
+                                 sid, *fields.values())
+        if not row:
+            raise HTTPException(404, "Stratégie introuvable")
+        if row["enabled"]:
+            await _ensure_watched(con, row["symbol"])
+        out = await con.fetchrow(STRATEGY_SQL + " WHERE s.id = $1", sid)
+    return _strategy_out(out)
+
+
+@app.delete("/api/strategies/{sid}", dependencies=[Depends(auth)])
+async def delete_strategy(sid: int):
+    async with pool.acquire() as con:
+        await con.execute("DELETE FROM strategies WHERE id = $1", sid)
+    return {"ok": True}
+
+
+def _trade_out(r) -> dict:
+    d = dict(r)
+    for k in ("entry_time", "exit_time", "created_at"):
+        d[k] = _epoch(d[k])
+    return d
+
+
+@app.get("/api/trades", dependencies=[Depends(auth)])
+async def list_trades(symbol: str | None = None, strategy_id: int | None = None, since: int | None = None,
+                      limit: int = Query(500, ge=1, le=5000)):
+    async with pool.acquire() as con:
+        rows = await con.fetch("""
+            SELECT t.id, t.strategy_id, s.name AS strategy_name, t.mode, t.symbol, t.side, t.stake, t.payout,
+                   t.duration, t.duration_unit, t.entry_time, t.entry_spot, t.exit_time, t.exit_spot, t.profit,
+                   t.status, t.contract_id, t.error, t.created_at
+            FROM trades t LEFT JOIN strategies s ON s.id = t.strategy_id
+            WHERE ($1::text IS NULL OR t.symbol = $1) AND ($2::int IS NULL OR t.strategy_id = $2)
+              AND ($3::bigint IS NULL OR t.entry_time >= to_timestamp($3))
+            ORDER BY t.entry_time DESC LIMIT $4""", symbol, strategy_id, since, limit)
+    return [_trade_out(r) for r in rows]
+
+
+@app.get("/api/signals", dependencies=[Depends(auth)])
+async def list_signals(strategy_id: int, limit: int = Query(100, ge=1, le=1000)):
+    async with pool.acquire() as con:
+        rows = await con.fetch("""SELECT id, strategy_id, symbol, tf, candle_ts, side, price, action, created_at
+                                  FROM signals WHERE strategy_id = $1 ORDER BY id DESC LIMIT $2""", strategy_id, limit)
+    return [{**dict(r), "candle_ts": _epoch(r["candle_ts"]), "created_at": _epoch(r["created_at"])} for r in rows]
+
+
+class BacktestIn(BaseModel):
+    strategy_id: int | None = None
+    kind: str | None = None
+    symbol: str | None = None
+    tf: int | None = None
+    params: dict | None = None
+    stake: float | None = Field(None, gt=0)
+    duration: int | None = Field(None, ge=1)
+    duration_unit: Literal["t", "s", "m"] | None = None
+    payout_ratio: float | None = Field(None, gt=0)
+    days: float = Field(7, gt=0, le=365)
+    date_to: int | None = None
+
+
+@app.post("/api/backtests", dependencies=[Depends(auth)], status_code=201)
+async def create_backtest(body: BacktestIn):
+    """Les champs fournis remplacent ceux de la stratégie (permet de tester des variantes)."""
+    cfg = {"stake": 1.0, "duration": 5, "duration_unit": "t", "payout_ratio": 0.95, "params": {}}
+    async with pool.acquire() as con:
+        if body.strategy_id is not None:
+            st = await con.fetchrow("SELECT * FROM strategies WHERE id = $1", body.strategy_id)
+            if not st:
+                raise HTTPException(404, "Stratégie introuvable")
+            cfg.update({k: st[k] for k in ("kind", "symbol", "tf", "stake", "duration", "duration_unit", "payout_ratio")})
+            cfg["params"] = _js(st["params"])
+        cfg.update({k: v for k, v in body.model_dump(exclude={"strategy_id", "days", "date_to"}).items() if v is not None})
+        for k in ("kind", "symbol", "tf"):
+            if k not in cfg:
+                raise HTTPException(400, f"Champ manquant : {k}")
+        await _check_strategy(con, cfg["kind"], cfg["tf"])
+        end = body.date_to or int(time.time())
+        bid = await con.fetchval("""
+            INSERT INTO backtests(strategy_id, kind, symbol, tf, params, stake, duration, duration_unit, payout_ratio,
+                                  date_from, date_to)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,to_timestamp($10),to_timestamp($11)) RETURNING id""",
+            body.strategy_id, cfg["kind"], cfg["symbol"], cfg["tf"], json.dumps(cfg["params"]), cfg["stake"],
+            cfg["duration"], cfg["duration_unit"], cfg["payout_ratio"], end - int(body.days * 86400), end)
+    return {"id": bid}
+
+
+def _backtest_out(r, with_trades: bool) -> dict:
+    d = dict(r)
+    d["params"] = _js(d["params"])
+    d["stats"] = _js(d["stats"])
+    d["trades"] = _js(d["trades"]) if with_trades else None
+    for k in ("date_from", "date_to", "created_at", "finished_at"):
+        d[k] = _epoch(d[k])
+    return d
+
+
+@app.get("/api/backtests", dependencies=[Depends(auth)])
+async def list_backtests(strategy_id: int | None = None, limit: int = Query(20, ge=1, le=200)):
+    async with pool.acquire() as con:
+        rows = await con.fetch("""SELECT * FROM backtests WHERE $1::int IS NULL OR strategy_id = $1
+                                  ORDER BY id DESC LIMIT $2""", strategy_id, limit)
+    return [_backtest_out(r, False) for r in rows]
+
+
+@app.get("/api/backtests/{bid}", dependencies=[Depends(auth)])
+async def get_backtest(bid: int):
+    async with pool.acquire() as con:
+        r = await con.fetchrow("SELECT * FROM backtests WHERE id = $1", bid)
+    if not r:
+        raise HTTPException(404, "Backtest introuvable")
+    return _backtest_out(r, True)

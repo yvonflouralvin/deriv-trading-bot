@@ -41,6 +41,118 @@ export interface CollectorStatus {
   ticks_written: number
 }
 
+export interface ParamSpec {
+  key: string
+  label: string
+  default: number
+  min: number
+  max: number
+  step: number
+}
+
+export interface StrategyKind {
+  kind: string
+  name: string
+  description: string
+  params: ParamSpec[]
+}
+
+export type Mode = 'paper' | 'demo'
+export type DurationUnit = 't' | 's' | 'm'
+
+export interface StrategyConfig {
+  name: string
+  kind: string
+  symbol: string
+  tf: number
+  params: Record<string, number>
+  mode: Mode
+  enabled: boolean
+  stake: number
+  duration: number
+  duration_unit: DurationUnit
+  payout_ratio: number
+  max_trades_per_day: number
+  max_daily_loss: number
+}
+
+export interface StrategyRow extends StrategyConfig {
+  id: number
+  kind_name: string | null
+  today_trades: number
+  today_pnl: number
+  today_wins: number
+  total_trades: number
+  total_pnl: number
+  total_wins: number
+  open_trades: number
+  errors: number
+}
+
+export interface Trade {
+  id: number
+  strategy_id: number | null
+  strategy_name?: string | null
+  mode: Mode
+  symbol: string
+  side: 'CALL' | 'PUT'
+  stake: number
+  payout: number | null
+  status: 'open' | 'won' | 'lost' | 'error'
+  entry_time: number
+  entry_spot: number | null
+  exit_time: number | null
+  exit_spot: number | null
+  profit: number | null
+  error: string | null
+}
+
+export interface BacktestTrade {
+  time: number
+  side: 'CALL' | 'PUT'
+  entry: number
+  exit: number
+  exit_time: number
+  won: boolean
+  profit: number
+}
+
+export interface BacktestStats {
+  trades: number
+  wins: number
+  losses: number
+  win_rate: number | null
+  breakeven_win_rate: number
+  pnl: number
+  max_drawdown: number
+  profit_factor: number | null
+  best_win_streak: number
+  worst_loss_streak: number
+  skipped_signals: number
+  unresolved_signals?: number
+  resolution: string
+  equity: [number, number][]
+  bars: number
+}
+
+export interface Backtest {
+  id: number
+  strategy_id: number | null
+  kind: string
+  symbol: string
+  tf: number
+  params: Record<string, number>
+  duration: number
+  duration_unit: DurationUnit
+  date_from: number
+  date_to: number
+  status: 'pending' | 'running' | 'done' | 'error'
+  stats: BacktestStats | null
+  trades: BacktestTrade[] | null
+  error: string | null
+  created_at: number
+}
+
 const BASE = import.meta.env.VITE_API_URL ?? ''
 const TOKEN_KEY = 'monitor.token'
 
@@ -83,11 +195,27 @@ export const api = {
   drawings: (symbol: string) => call<unknown[]>(`/drawings/${encodeURIComponent(symbol)}`),
   saveDrawings: (symbol: string, json: string) =>
     call(`/drawings/${encodeURIComponent(symbol)}`, { method: 'PUT', body: json }),
+  kinds: () => call<StrategyKind[]>('/strategy-kinds'),
+  strategies: () => call<StrategyRow[]>('/strategies'),
+  createStrategy: (c: StrategyConfig) => call<StrategyRow>('/strategies', { method: 'POST', body: JSON.stringify(c) }),
+  patchStrategy: (id: number, c: Partial<StrategyConfig>) =>
+    call<StrategyRow>(`/strategies/${id}`, { method: 'PATCH', body: JSON.stringify(c) }),
+  deleteStrategy: (id: number) => call(`/strategies/${id}`, { method: 'DELETE' }),
+  trades: (q: { symbol?: string; strategy_id?: number; since?: number; limit?: number }) =>
+    call<Trade[]>(`/trades?${new URLSearchParams(
+      Object.entries(q).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)]),
+    )}`),
+  runBacktest: (strategy_id: number, days: number) =>
+    call<{ id: number }>('/backtests', { method: 'POST', body: JSON.stringify({ strategy_id, days }) }),
+  backtests: (strategy_id: number) => call<Backtest[]>(`/backtests?strategy_id=${strategy_id}&limit=10`),
+  backtest: (id: number) => call<Backtest>(`/backtests/${id}`),
 }
 
 export type LiveMessage =
   | { type: 'tick'; symbol: string; time: number; price: number }
   | { type: 'candle'; symbol: string; tf: number; candle: Candle }
+  | { type: 'trade'; symbol: string; trade: Trade }
+  | { type: 'signal'; symbol: string; strategy_id: number; side: string; time: number; price: number; action: string }
   | { type: 'subscribed' | 'pong' }
 
 /** WebSocket temps réel avec reconnexion automatique. */

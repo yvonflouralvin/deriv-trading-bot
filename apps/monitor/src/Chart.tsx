@@ -14,7 +14,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { DrawingManager, type DrawingKind } from 'lightweight-charts-drawing'
-import { api, LiveFeed, type Candle, type LiveMessage } from './api'
+import { api, LiveFeed, type BacktestTrade, type Candle, type LiveMessage, type Trade } from './api'
 import { STRATEGIES } from './strategies'
 
 export interface ActiveStrategy {
@@ -30,6 +30,8 @@ interface Props {
   magnet: boolean
   strategies: ActiveStrategy[]
   clearToken: number
+  overlay: { label: string; symbol: string; tf: number; trades: BacktestTrade[] } | null
+  showTrades: boolean
   onToolDone: () => void
   onLive: (connected: boolean) => void
   onError: (e: unknown) => void
@@ -46,6 +48,7 @@ export default function Chart(p: Props) {
   const drawings = useRef<DrawingManager | null>(null)
   const feed = useRef<LiveFeed | null>(null)
   const bars = useRef<Candle[]>([])
+  const trades = useRef<Map<number, Trade>>(new Map())
   const view = useRef({ symbol: p.symbol, tf: p.tf, loading: false, exhausted: false, importing: false })
   const latest = useRef(p)
   latest.current = p
@@ -120,6 +123,11 @@ export default function Chart(p: Props) {
   // ---- temps réel ----------------------------------------------------------
   function onLive(m: LiveMessage) {
     const v = view.current
+    if (m.type === 'trade' && m.symbol === v.symbol) {
+      trades.current.set(m.trade.id, m.trade)
+      redrawStrategies()
+      return
+    }
     if (m.type !== 'candle' || m.symbol !== v.symbol || m.tf !== v.tf || !series.current) return
     const b = bars.current
     const last = b[b.length - 1]
@@ -138,6 +146,7 @@ export default function Chart(p: Props) {
     v.tf = p.tf
     v.exhausted = false
     bars.current = []
+    trades.current = new Map()
     series.current?.setData([])
     feed.current?.subscribe(p.symbol, p.tf)
     drawings.current?.setInterval(p.tfLabel)
@@ -152,6 +161,13 @@ export default function Chart(p: Props) {
         setLegend(candles[candles.length - 1] ?? null)
         setCount(candles.length)
         redrawStrategies()
+        if (candles.length) {
+          api.trades({ symbol: p.symbol, since: candles[0].time, limit: 2000 }).then((ts) => {
+            if (cancelled) return
+            trades.current = new Map(ts.map((t) => [t.id, t]))
+            redrawStrategies()
+          }).catch(p.onError)
+        }
         const dm = drawings.current!
         v.importing = true
         try {
@@ -172,7 +188,7 @@ export default function Chart(p: Props) {
   useEffect(() => { if (p.clearToken) drawings.current?.clear() }, [p.clearToken])
 
   // ---- stratégies --------------------------------------------------------------
-  useEffect(() => { redrawStrategies() }, [p.strategies]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { redrawStrategies() }, [p.strategies, p.overlay, p.showTrades]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function redrawStrategies() {
     const c = chart.current
@@ -192,12 +208,43 @@ export default function Chart(p: Props) {
       lines.current[i].applyOptions({ color: l.color, title: l.name })
       lines.current[i].setData(l.data.map((d) => ({ time: t(d.time), value: d.value })))
     })
+    const tf = view.current.tf
+    const first = bars.current[0]?.time ?? 0
+    const snap = (x: number) => x - (x % tf)      // un marqueur doit tomber sur une bougie
     const m: SeriesMarker<Time>[] = out
       .flatMap((o) => o.signals)
-      .sort((a, b) => a.time - b.time)
       .map((s) => s.side === 'CALL'
-        ? { time: t(s.time), position: 'belowBar', color: '#26a69a', shape: 'arrowUp', text: 'CALL' }
-        : { time: t(s.time), position: 'aboveBar', color: '#ef5350', shape: 'arrowDown', text: 'PUT' })
+        ? { time: t(s.time), position: 'belowBar' as const, color: '#26a69a88', shape: 'arrowUp' as const, text: '' }
+        : { time: t(s.time), position: 'aboveBar' as const, color: '#ef535088', shape: 'arrowDown' as const, text: '' })
+
+    const L = latest.current
+    if (L.showTrades) {
+      const colors = { open: '#2962ff', won: '#26a69a', lost: '#ef5350', error: '#787b86' }
+      for (const tr of trades.current.values()) {
+        if (tr.entry_time < first) continue
+        const label = `${tr.mode === 'demo' ? 'D' : 'P'}${tr.profit != null ? ` ${tr.profit > 0 ? '+' : ''}${tr.profit.toFixed(2)}` : tr.status === 'error' ? ' ⚠' : ''}`
+        m.push({
+          time: t(snap(tr.entry_time)),
+          position: tr.side === 'CALL' ? 'belowBar' : 'aboveBar',
+          shape: tr.side === 'CALL' ? 'arrowUp' : 'arrowDown',
+          color: colors[tr.status],
+          text: label,
+        })
+      }
+    }
+    if (L.overlay && L.overlay.symbol === view.current.symbol && L.overlay.tf === tf) {
+      for (const bt of L.overlay.trades) {
+        if (bt.time < first) continue
+        m.push({
+          time: t(snap(bt.time)),
+          position: bt.side === 'CALL' ? 'belowBar' : 'aboveBar',
+          shape: 'circle',
+          color: bt.won ? '#26a69a' : '#ef5350',
+          text: bt.won ? '✓' : '✗',
+        })
+      }
+    }
+    m.sort((a, b) => (a.time as number) - (b.time as number))
     markers.current.setMarkers(m)
   }
 
