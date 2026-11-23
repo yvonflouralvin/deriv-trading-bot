@@ -62,6 +62,14 @@ services:
       - api
     expose:
       - "80"
+    # Traefik (le routeur de Dokploy) ne voit que les conteneurs de ce réseau
+    networks:
+      - default
+      - dokploy-network
 
 volumes:
   db-data:
+
+networks:
+  dokploy-network:
+    external: true
