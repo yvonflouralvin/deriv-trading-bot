@@ -1,0 +1,67 @@
+# Plateforme de trading — V1
+#   db        : PostgreSQL + TimescaleDB (ticks, bougies, watchlist, dessins)
+#   collector : Service 1 — collecte des ticks Deriv, construit les bougies
+#   api       : FastAPI — REST + WebSocket temps réel pour le Monitor
+#   monitor   : Service 2 — interface web (nginx), seul service exposé
+#
+# Dokploy : Create Service → Compose, ce dépôt, chemin ./docker-compose.yml.
+# Domaine : sur le service "monitor", port 80.
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trading
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?définir POSTGRES_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  collector:
+    build:
+      context: .
+      dockerfile: services/collector/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://trading:${POSTGRES_PASSWORD}@db:5432/trading
+      DERIV_APP_ID: ${DERIV_APP_ID:?définir DERIV_APP_ID}
+      DERIV_TOKEN: ${DERIV_TOKEN:-}
+      DERIV_ACCOUNT_ID: ${DERIV_ACCOUNT_ID:-}
+      DEFAULT_SYMBOLS: ${DEFAULT_SYMBOLS:-R_100,R_75,1HZ100V}
+      TIMEFRAMES: ${TIMEFRAMES:-60,300,900,3600,14400,86400}
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://trading:${POSTGRES_PASSWORD}@db:5432/trading
+      API_TOKEN: ${API_TOKEN:?définir API_TOKEN (mot de passe du Monitor)}
+      TIMEFRAMES: ${TIMEFRAMES:-60,300,900,3600,14400,86400}
+    expose:
+      - "8000"
+
+  monitor:
+    build:
+      context: ./apps/monitor
+    restart: unless-stopped
+    depends_on:
+      - api
+    expose:
+      - "80"
+
+volumes:
+  db-data:
