@@ -615,3 +615,40 @@ async def get_trend_report(rid: int):
     if not r:
         raise HTTPException(404, "Rapport introuvable")
     return _report_out(r, True)
+
+
+# --------------------------------------------------------------------------- #
+# Portefeuille diversifié en paper trading (calculé par le moteur, voir services/engine/portfolio)
+# --------------------------------------------------------------------------- #
+@app.get("/api/portfolio", dependencies=[Depends(auth)])
+async def portfolio(events: int = Query(50, ge=0, le=1000)):
+    async with pool.acquire() as con:
+        book = await con.fetchval("SELECT value FROM pf_meta WHERE key='book'")
+        navs = await con.fetch("SELECT d, sleeve, nav, exposure FROM pf_nav ORDER BY d, sleeve")
+        evs = await con.fetch("SELECT d, kind, payload FROM pf_events ORDER BY id DESC LIMIT $1", events)
+    book = _js(book) if book else None
+    series: dict[str, list] = {}
+    for r in navs:
+        series.setdefault(r["sleeve"], []).append({"d": r["d"].isoformat(), "nav": r["nav"], "exposure": r["exposure"]})
+    # rendements mensuels du total (dernière valeur de chaque mois vs dernière valeur du mois précédent)
+    monthly, prev, last_by_month = [], None, {}
+    for p in series.get("total", []):
+        last_by_month[p["d"][:7]] = p["nav"]
+    start = book["capital"] if book else None
+    for m in sorted(last_by_month):
+        base = prev if prev is not None else start
+        monthly.append({"mois": m, "nav": last_by_month[m], "rendement": (last_by_month[m] / base - 1) if base else None})
+        prev = last_by_month[m]
+    positions = []
+    if book:
+        for sleeve, sl in book["sleeves"].items():
+            for sym, p in sl["pos"].items():
+                px = book["last_px"].get(sym, p["price"])
+                positions.append({"poche": sleeve, "symbole": sym, "unites": p["units"], "prix_entree": p["price"],
+                                  "dernier_prix": px, "valeur": p["units"] * px, "depuis": p["since"]})
+    return {"mode": "paper", "capital_initial": start, "dernier_jour": book["last_d"] if book else None,
+            "valeur": series["total"][-1]["nav"] if series.get("total") else start,
+            "poches": {k: v[-1] for k, v in series.items() if k != "total" and v},
+            "positions": positions, "ordres_en_attente": book["pending"] if book else [],
+            "mensuel": monthly, "historique": series.get("total", []),
+            "journal": [{"d": r["d"].isoformat(), "type": r["kind"], **_js(r["payload"])} for r in evs]}

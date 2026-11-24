@@ -245,3 +245,37 @@ CREATE TRIGGER trend_reports_created
 
 -- v2 : comparateur de variantes du détecteur
 ALTER TABLE trend_reports ADD COLUMN IF NOT EXISTS variants text[] NOT NULL DEFAULT '{}';
+
+-- Portefeuille diversifié en paper trading (services/engine/portfolio) -----
+-- cours journaliers (Yahoo Finance) des ETF et du BTC utilisés par le portefeuille
+CREATE TABLE IF NOT EXISTS pf_prices (
+    symbol text NOT NULL,
+    d      date NOT NULL,
+    open   double precision NOT NULL,
+    close  double precision NOT NULL,
+    adj    double precision NOT NULL,
+    PRIMARY KEY (symbol, d)
+);
+-- état du portefeuille virtuel (clé 'book') et suivi des exécutions (clé 'run')
+CREATE TABLE IF NOT EXISTS pf_meta (
+    key        text PRIMARY KEY,
+    value      jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+-- valeur quotidienne par poche (rotation, rsi2, btc) et totale
+CREATE TABLE IF NOT EXISTS pf_nav (
+    d        date NOT NULL,
+    sleeve   text NOT NULL,
+    nav      double precision NOT NULL,
+    exposure double precision,
+    PRIMARY KEY (d, sleeve)
+);
+-- journal : ordres exécutés et signaux
+CREATE TABLE IF NOT EXISTS pf_events (
+    id         bigserial PRIMARY KEY,
+    d          date NOT NULL,
+    kind       text NOT NULL,
+    payload    jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS pf_events_d ON pf_events (d DESC);

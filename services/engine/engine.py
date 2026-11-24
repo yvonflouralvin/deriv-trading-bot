@@ -28,6 +28,7 @@ import asyncpg
 
 import backtest
 from analysis.service import TREND_TFS, AnalysisService
+from portfolio.service import PortfolioService
 from deriv import TOKEN, USE_NEW_API, DerivClient, DerivError
 from strategies import REGISTRY, Bar
 
@@ -444,7 +445,8 @@ class Engine:
                     info = {"strategies": len(self.strategies), "open_trades": open_n,
                             "signals": self.stats["signals"], "trades": self.stats["trades"],
                             "demo_enabled": DEMO_TRADING_ENABLED, "demo_connected": self.demo.connected,
-                            "uptime_s": int(time.time() - self.stats["started"])}
+                            "uptime_s": int(time.time() - self.stats["started"]),
+                            "portfolio": getattr(getattr(self, "portfolio", None), "status", None)}
                     await con.execute("""
                         INSERT INTO service_status(name, last_seen, info) VALUES('engine', now(), $1)
                         ON CONFLICT (name) DO UPDATE SET last_seen=now(), info=EXCLUDED.info""", json.dumps(info))
@@ -503,6 +505,8 @@ async def main():
 
     analysis = AnalysisService(pool)
     log.info("Analyse de tendance sur %s", ", ".join(f"{tf // 60} min" for tf in TREND_TFS))
+    portfolio = PortfolioService(pool)
+    eng.portfolio = portfolio
 
     listener = await asyncpg.connect(DATABASE_URL)
     await listener.add_listener("market", eng.on_market)
@@ -512,7 +516,7 @@ async def main():
 
     tasks = [asyncio.create_task(t) for t in
              (eng.paper_resolver(), eng.backtest_worker(), eng.heartbeat(), eng.reloader(),
-              analysis.sync_loop(), analysis.report_worker())]
+              analysis.sync_loop(), analysis.report_worker(), portfolio.loop())]
     await stop.wait()
     log.info("Arrêt demandé")
     for t in tasks:
